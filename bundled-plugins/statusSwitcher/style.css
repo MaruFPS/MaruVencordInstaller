@@ -1,0 +1,45 @@
+/*
+ * Keep Discord's native account-panel button sizing/spacing.
+ * Same compatibility rule used by Vencord's account-panel button plugins.
+ */
+[class*="panels"] [class*="accountPopoutButtonWrapper"] {
+    min-width: 0;
+}
+
+/*
+ * Status icon is intentionally left at the v4 size.
+ * Only the arrow and horizontal breathing room are increased.
+ */
+.vc-status-switcher-control {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    width: 39px;
+    height: 20px;
+    overflow: visible;
+}
+
+.vc-status-switcher-presence {
+    display: block;
+    flex: 0 0 18px;
+    overflow: visible;
+}
+
+.vc-status-switcher-chevron {
+    display: block;
+    flex: 0 0 12px;
+    color: var(--interactive-normal);
+    overflow: visible;
+}
+
+/*
+ * Widen the actual clickable / hoverable button with the content so the
+ * hover pill doesn't hug the larger arrow too tightly.
+ */
+#app-mount [class*="panels"]
+:is(button, [role="button"]):has(.vc-status-switcher-control) {
+    width: 43px !important;
+    min-width: 43px !important;
+    padding-inline: 2px !important;
+}

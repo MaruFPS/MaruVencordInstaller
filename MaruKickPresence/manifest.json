@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Maru Kick Presence",
+  "version": "0.2.1",
+  "description": "Shows your current Kick viewing activity as Discord Rich Presence.",
+  "permissions": [
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:9865/*",
+    "https://kick.com/*",
+    "https://www.kick.com/*",
+    "https://dashboard.kick.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://kick.com/*",
+        "https://www.kick.com/*",
+        "https://dashboard.kick.com/*"
+      ],
+      "js": [
+        "kick.js"
+      ]
+    }
+  ]
+}

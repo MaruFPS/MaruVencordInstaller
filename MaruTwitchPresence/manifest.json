@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Maru Twitch Presence",
+  "version": "0.2.1",
+  "description": "Shows your current Twitch viewing activity as Discord Rich Presence.",
+  "permissions": [
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:9864/*",
+    "https://www.twitch.tv/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.twitch.tv/*"
+      ],
+      "js": [
+        "twitch.js"
+      ]
+    }
+  ]
+}

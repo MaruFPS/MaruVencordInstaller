@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "current": {
+    "twitchPresence.desktop/index.tsx": "411a9c8be216f497b08decdddf232e747b343b3e797a3cd23313c185e19df650",
+    "twitchPresence.desktop/native.ts": "dbd8e869ca7fea691de6a7e000db69679e8cfd00911d2886e5c42bb0265634d3",
+    "twitchPresence.desktop/TwitchPanel.tsx": "afaf37312bd4bba900cdb345fec0526d9d4a3da9759fe9785c280938c4e11fc5",
+    "kickPresence.desktop/index.tsx": "ac35cc58e0c8f9bfbca558022e4b501d950f8f38a9f7c7becf56eb7a70bf5a1f",
+    "kickPresence.desktop/native.ts": "a7bb0c55bf6d85d0fdbceac9d81ce52f0e43112303b95b8fd05c8ca1b79728ee",
+    "kickPresence.desktop/KickPanel.tsx": "a8d8d6a1d4152b0b7fd3c9e6065f32b4f33e70ae05ec6ed9d87825a49183df61",
+    "ytmDesktopControls.desktop/index.tsx": "fbff7d374c06d38bb9637abcc8f9eb60581a87065e5e92716ab8c6a7a7c84a03",
+    "ytmDesktopControls.desktop/native.ts": "f38b3b15018013479efda5e1381162efce992ad8f5b6bffd6a7287fa36241b44",
+    "ytmDesktopControls.desktop/PlayerComponent.tsx": "35752ecca01698346c0de550e743c1e4d3bac5319a63d6c99ccbfc11e865b4bc",
+    "statusSwitcher/index.tsx": "62220cee055467fe1e53daf7c2197126babcfbaa6e5e4b519e47823e3060ff32",
+    "statusSwitcher/style.css": "0fe3fe02321569975571f3cd1d3da50902312775c2c60dcce97b6633394f5f4f",
+    "maruWPEBackground/index.ts": "502ddf6defce58e8adffbe1e2a4dda168d63a5f964a68a18a32f935ab0425556",
+    "maruWPEBackground/native.ts": "9e501b05b2b6770ed6f07c1242abeb0891d9dd6aa8faae689e33d91e693d914e",
+    "maruFriendsSidebar/index.ts": "2533ae6e175aac50c106e2f6ef98f0c899120c8b1f5e16c5207d69887ba8d011"
+  },
+  "legacyReleases": [
+    {
+      "id": "previous-0.1.0-win-unpacked",
+      "files": {
+        "twitchPresence.desktop/index.tsx": "411a9c8be216f497b08decdddf232e747b343b3e797a3cd23313c185e19df650",
+        "twitchPresence.desktop/native.ts": "dbd8e869ca7fea691de6a7e000db69679e8cfd00911d2886e5c42bb0265634d3",
+        "twitchPresence.desktop/TwitchPanel.tsx": "afaf37312bd4bba900cdb345fec0526d9d4a3da9759fe9785c280938c4e11fc5",
+        "kickPresence.desktop/index.tsx": "ac35cc58e0c8f9bfbca558022e4b501d950f8f38a9f7c7becf56eb7a70bf5a1f",
+        "kickPresence.desktop/native.ts": "a7bb0c55bf6d85d0fdbceac9d81ce52f0e43112303b95b8fd05c8ca1b79728ee",
+        "kickPresence.desktop/KickPanel.tsx": "a8d8d6a1d4152b0b7fd3c9e6065f32b4f33e70ae05ec6ed9d87825a49183df61",
+        "ytmDesktopControls.desktop/index.tsx": "fbff7d374c06d38bb9637abcc8f9eb60581a87065e5e92716ab8c6a7a7c84a03",
+        "ytmDesktopControls.desktop/native.ts": "f38b3b15018013479efda5e1381162efce992ad8f5b6bffd6a7287fa36241b44",
+        "ytmDesktopControls.desktop/PlayerComponent.tsx": "35752ecca01698346c0de550e743c1e4d3bac5319a63d6c99ccbfc11e865b4bc",
+        "statusSwitcher/index.tsx": "62220cee055467fe1e53daf7c2197126babcfbaa6e5e4b519e47823e3060ff32",
+        "statusSwitcher/style.css": "0fe3fe02321569975571f3cd1d3da50902312775c2c60dcce97b6633394f5f4f",
+        "maruWPEBackground/index.ts": "502ddf6defce58e8adffbe1e2a4dda168d63a5f964a68a18a32f935ab0425556",
+        "maruWPEBackground/native.ts": "9e501b05b2b6770ed6f07c1242abeb0891d9dd6aa8faae689e33d91e693d914e"
+      }
+    }
+  ],
+  "overrides": {
+    "revision": "16ec4ea838899706019e7f472e45f055070abeb1",
+    "files": {
+      "src/components/settings/tabs/themes/LocalThemesTab.tsx": {
+        "upstreamSha256": "a5b00cecb7eb1b9b7f83ab7b2580a6df870899b3d61169bdd36af8c2f227c006",
+        "overrideSha256": "5d411249c3b860cc1365ac60dbae0ddfcf1b59d9b8d1bae5e32c2f93f501efd3"
+      },
+      "src/components/settings/tabs/vencord/index.tsx": {
+        "upstreamSha256": "31a657c6e86179cf25454a88109f8c11b03152f8cb785154e06159d932d31b25",
+        "overrideSha256": "98b21b11184a4a85a4537f9124b454f9132e1c389edc3242cd06e90a2d52f99e"
+      }
+    }
+  }
+}
