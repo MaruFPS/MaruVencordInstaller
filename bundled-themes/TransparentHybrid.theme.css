@@ -21,7 +21,7 @@
   /*
     Theme Background
   */
-  --theme-background-image: url(https://github.com/MaruFPS/MarusWidgets/blob/main/discord%20assets/current-default.jpg?raw=true);
+  --theme-background-image: url(https://github.com/MaruFPS/MarusPersonalTingz/blob/main/discord%20assets/current-default.jpg?raw=true);
 
   /* Theme Background Behavior */
   --theme-background-position: center center;
@@ -49,7 +49,7 @@
       125% = slightly zoomed
       150% = more zoomed
   */
-  --home-icon-image: url(https://github.com/MaruFPS/MarusWidgets/blob/main/discord%20assets/triple%20cross.jpg?raw=true);
+  --home-icon-image: url(https://github.com/MaruFPS/MarusPersonalTingz/blob/main/discord%20assets/triple%20cross.jpg?raw=true);
   --home-icon-image-position: center center;
   --home-icon-image-zoom: 100%;
   --home-icon-image-repeat: no-repeat;
@@ -253,7 +253,7 @@
       125%  = slightly zoomed
       150%  = more zoomed
   */
-  --maru-favorites-icon-image: url("https://github.com/MaruFPS/MarusWidgets/blob/main/discord%20assets/default-favs.jpg?raw=true");
+  --maru-favorites-icon-image: url(https://github.com/MaruFPS/MarusPersonalTingz/blob/main/discord%20assets/default-favs.jpg?raw=true);
   --maru-favorites-icon-position: calc(50% - 2px) calc(50% + 2px);
   --maru-favorites-icon-size: 150%;
   --maru-favorites-icon-repeat: no-repeat;
