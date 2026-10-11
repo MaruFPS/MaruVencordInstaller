@@ -40,7 +40,7 @@ const VENCORD_GITHUB_API_MAIN_COMMIT_URL =
     "https://api.github.com/repos/Vendicated/Vencord/commits/main";
 
 const MARU_PLUGIN_PRESET_URL =
-    "https://raw.githubusercontent.com/MaruFPS/MarusWidgets/main/vencord/presets/maru-plugin-preset.json";
+    "https://raw.githubusercontent.com/MaruFPS/MaruVencordInstaller/main/vencord/presets/maru-plugin-preset.json";
 
 const MARU_PLUGIN_PRESET_VERSION =
     1;
