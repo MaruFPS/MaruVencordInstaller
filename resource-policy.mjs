@@ -66,7 +66,30 @@ export function assessInstalledPlugins(root, registry, policy) {
         return { upgradeEligible: true, updateSafe: true, legacyRelease: legacy.id, reason: "Verified five-plugin release; use Update Maru Plug-ins to add Friends Sidebar." };
     if (matches(policy.current))
         return { upgradeEligible: false, updateSafe: true, reason: "Approved six-plugin payload is installed." };
-    return { upgradeEligible: false, updateSafe: false, reason: "Managed plugin files are incomplete, modified, or from an unrecognized release. Automatic replacement is blocked; preserve and review these files first." };
+
+    // Recovery is separate from normal/staged update eligibility. Absent approved
+    // files may be restored when every surviving managed file belongs
+    // to one trusted release. Extra files/plugins are never copied over or removed.
+    const expected = Object.entries(registry).flatMap(([name, files]) => files.map(file => approvedRelative(`${name}/${file}`))).sort();
+    if (JSON.stringify(expected) !== JSON.stringify(Object.keys(policy.current).sort()))
+        throw new Error("Plugin registry and approved payload policy disagree.");
+    const missingFiles = [];
+    const present = [];
+    for (const rel of expected) {
+        const file = join(root, rel);
+        assertSafePath(file);
+        if (!existsSync(file)) missingFiles.push(rel);
+        else if (!regular(file))
+            return { upgradeEligible: false, updateSafe: false, repairEligible: false, reason: `Managed plugin file is not a non-empty regular file: ${rel}. It will not be overwritten.` };
+        else present.push([rel, sha256(file)]);
+    }
+    const trustedRelease = [
+        { id: "current", files: policy.current },
+        ...policy.legacyReleases
+    ].find(release => present.every(([rel, hash]) => release.files[rel] === hash));
+    if (missingFiles.length && trustedRelease)
+        return { upgradeEligible: false, updateSafe: false, repairEligible: true, missingFiles, recoveryRelease: trustedRelease.id, reason: `${missingFiles.length} approved plugin file(s) are missing; surviving managed files match a trusted release. Use Repair Managed Vencord to restore bundled plugins, then continue Automatic Setup.` };
+    return { upgradeEligible: false, updateSafe: false, repairEligible: false, reason: "Managed plugin files are modified or from an unrecognized release. Repair will not overwrite them. Verified managed Discord patches can still be uninstalled below; the workspace and custom files are kept." };
 }
 
 export function copyApprovedPlugin(bundleRoot, destination, name, registry, policy) {

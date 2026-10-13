@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require("electron"); 
 
 contextBridge.exposeInMainWorld("maruInstaller", { 
-    version: "0.2.0", 
+    version: "0.2.3",
 
     getAppRuntimeState: () => {
         return ipcRenderer.invoke(

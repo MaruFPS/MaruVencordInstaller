@@ -1754,6 +1754,7 @@
         let currentManagedBuildState = null;
         let currentManagedVencordUpdateState = null;
         let currentMaruPluginUpdateState = null;
+        let maruPluginUpdateInProgress = false;
         let currentMaruHybridThemeState = null;
         let currentDiscordInstalls = [];
         let currentDiscordPatchDetails = [];
@@ -2892,7 +2893,6 @@
             const show =
                 hasTarget &&
                 planAvailable &&
-                !blocked &&
                 !packagedComplete;
 
             automaticSetupSection.style.display =
@@ -2901,7 +2901,14 @@
                     : "none";
 
             automaticSetupButton.disabled =
-                !show;
+                !show || blocked || maruPluginUpdateInProgress;
+
+            if (show && blocked) {
+                automaticSetupButton.textContent = "Run Automatic Setup";
+                automaticSetupStatus.textContent = "Automatic Setup is paused to protect existing files. Review the blocker above and the Repair Managed Vencord / Maru Plug-ins actions below.";
+                automaticSetupStatus.style.color = "#fee75c";
+                return;
+            }
 
             if (!show) {
                 automaticSetupStatus.textContent =
@@ -3790,57 +3797,33 @@
         }
 
         function updateRepairManagedVencordButton() {
-            const selectedUninstallState =
-                currentManagedUninstallStates.find(
-                    state =>
-                        state.name === selectedDiscord?.name
-                );
-
-            const canRepair =
-                Boolean(selectedDiscord) &&
-                currentManagedBuildState === "built" &&
-                selectedUninstallState?.state === "managed" &&
-                selectedUninstallState?.eligible === true;
-
-            repairManagedVencordButton.style.display =
-                canRepair
-                    ? "inline-block"
-                    : "none";
-
-            repairManagedVencordButton.disabled =
-                !canRepair;
-
-            if (!canRepair) {
-                repairManagedVencordStatus.textContent =
-                    "";
-            }
+            const ownership = currentManagedUninstallStates.find(state => state.name === selectedDiscord?.name);
+            const pluginRepair = currentMaruPluginUpdateState?.available === true && currentMaruPluginUpdateState?.repairEligible === true;
+            const patchRepair = Boolean(selectedDiscord) && currentManagedBuildState === "built" && ownership?.state === "managed" && ownership?.eligible === true;
+            const show = currentVencordState === "repository" || ownership?.state === "managed";
+            repairManagedVencordButton.style.display = show ? "inline-block" : "none";
+            repairManagedVencordButton.disabled = maruPluginUpdateInProgress || !(pluginRepair || patchRepair);
+            repairManagedVencordButton.textContent = pluginRepair ? "Repair Missing Maru Plug-ins" : "Repair Managed Vencord";
+            if (show && !(pluginRepair || patchRepair)) {
+                repairManagedVencordStatus.textContent = currentMaruPluginUpdateState?.available === false
+                    ? currentMaruPluginUpdateState.reason
+                    : currentManagedBuildState !== "built"
+                        ? "Discord patch repair needs a completed build. Restore missing plugins first, then continue Automatic Setup."
+                        : ownership?.reason ?? "Select a verified managed Discord installation for patch repair.";
+                repairManagedVencordStatus.style.color = "#fee75c";
+            } else if (!show) repairManagedVencordStatus.textContent = "";
         }
 
-
         function updateUninstallManagedVencordButton() {
-            const selectedUninstallState =
-                currentManagedUninstallStates.find(
-                    state =>
-                        state.name === selectedDiscord?.name
-                );
-
-            const canUninstall =
-                Boolean(selectedDiscord) &&
-                selectedUninstallState?.state === "managed" &&
-                selectedUninstallState?.eligible === true;
-
-            uninstallManagedVencordButton.style.display =
-                canUninstall
-                    ? "inline-block"
-                    : "none";
-
-            uninstallManagedVencordButton.disabled =
-                !canUninstall;
-
-            if (!canUninstall) {
-                uninstallManagedVencordStatus.textContent =
-                    "";
-            }
+            const ownership = currentManagedUninstallStates.find(state => state.name === selectedDiscord?.name);
+            const canUninstall = Boolean(selectedDiscord) && ownership?.state === "managed" && ownership?.eligible === true;
+            const show = Boolean(selectedDiscord) && (currentVencordState === "repository" || ownership?.state === "managed");
+            uninstallManagedVencordButton.style.display = show ? "inline-block" : "none";
+            uninstallManagedVencordButton.disabled = !canUninstall || maruPluginUpdateInProgress;
+            if (show && !canUninstall) {
+                uninstallManagedVencordStatus.textContent = ownership?.reason ?? "Removal is unavailable until ownership of the selected Discord patch can be verified. Plugin recovery does not require patch ownership.";
+                uninstallManagedVencordStatus.style.color = "#fee75c";
+            } else if (!show) uninstallManagedVencordStatus.textContent = "";
         }
 
 
@@ -4412,7 +4395,7 @@
 
         function updateMaruPluginsButtonState() {
             const canUpdate =
-                currentMaruPluginUpdateState
+                !maruPluginUpdateInProgress && currentMaruPluginUpdateState
                     ?.available === true &&
                 currentMaruPluginUpdateState
                     ?.updateAvailable === true;
@@ -4424,6 +4407,9 @@
 
             updateMaruPluginsButton.disabled =
                 !canUpdate;
+            updateMaruPluginsButton.textContent = currentMaruPluginUpdateState?.repairEligible
+                ? "Restore Missing Maru Plug-ins" : "Update Maru Plug-ins";
+            updateRepairManagedVencordButton();
         }
 
         function renderMaruPluginUpdateState(
@@ -4489,9 +4475,11 @@
                 }
 
                 maruPluginUpdateStatus.textContent =
-                    updateState.upgradeEligible
-                        ? "Friends Sidebar upgrade ready — verified previous five-plugin release. Use Update Maru Plug-ins, then continue setup."
-                        : `↑ Maru Plug-ins Update Detected${details.length > 0 ? ` — ${details.join(" + ")}` : ""}.`;
+                    updateState.repairEligible
+                        ? "Missing Maru plug-in files can be restored safely. Use Repair Missing Maru Plug-ins below; surviving files match approved release hashes. A verified backup and rebuild are required, then continue Automatic Setup."
+                        : updateState.upgradeEligible
+                            ? "Friends Sidebar upgrade ready — verified previous five-plugin release. Use Update Maru Plug-ins, then continue setup."
+                            : `↑ Maru Plug-ins Update Detected${details.length > 0 ? ` — ${details.join(" + ")}` : ""}.`;
 
                 maruPluginUpdateStatus.style.color =
                     "#fee75c";
@@ -6156,10 +6144,9 @@
             }
         }
 
-        updateMaruPluginsButton.addEventListener(
-            "click",
-            async () => {
+        async function runMaruPluginUpdate() {
                 if (
+                    maruPluginUpdateInProgress || currentMaruPluginUpdateState?.available !== true ||
                     currentMaruPluginUpdateState
                         ?.updateAvailable !== true
                 ) {
@@ -6168,13 +6155,17 @@
 
                 const confirmed =
                     window.confirm(
-                        "Update the installed Maru plug-ins now?\n\nFully quit Discord from the system tray first. Closing the Discord window is not enough because Discord can keep running in the background.\n\nThe installer will back up the current Maru plug-in files, update only installer-owned files, rebuild Managed Vencord, verify the result, and roll back if verification fails."
+                        "Restore or update the installed Maru plug-ins now?\n\nFully quit Discord from the system tray first. Closing the Discord window is not enough because Discord can keep running in the background.\n\nThe installer will back up the current Maru plug-in files, restore absent approved files and update only verified release files, keep all extra files and unrelated plugins, prepare verified managed build tools and restore the required plugin dependency if needed (backing up package.json and its lockfile first), rebuild Managed Vencord, verify the result, and roll back if verification fails."
                     );
 
                 if (!confirmed) {
                     return;
                 }
 
+                maruPluginUpdateInProgress = true;
+                updateRepairManagedVencordButton();
+                updateUninstallManagedVencordButton();
+                updateAutomaticSetupButton();
                 updateMaruPluginsButton.disabled =
                     true;
 
@@ -6236,6 +6227,7 @@
                     await refreshManagedInstalledPluginsState();
                     await refreshManagedBuildState();
                     await refreshMaruPluginUpdateState();
+                    await refreshManagedInstallPlan();
 
                     // Keep the operation result visible after state refreshes.
                     // The refresh above updates button/current-state logic, but
@@ -6270,13 +6262,16 @@
                     maruPluginUpdateStatus.style.color =
                         "#f23f42";
                 } finally {
+                    maruPluginUpdateInProgress = false;
                     updateMaruPluginsButton.textContent =
                         "Update Maru Plug-ins";
 
                     updateMaruPluginsButtonState();
+                    updateUninstallManagedVencordButton();
+                    updateAutomaticSetupButton();
                 }
-            }
-        );
+        }
+        updateMaruPluginsButton.addEventListener("click", runMaruPluginUpdate);
 
 
         verifyPackageManagerButton.addEventListener(
@@ -6871,6 +6866,11 @@
         repairManagedVencordButton.addEventListener(
             "click",
             async () => {
+                if (currentMaruPluginUpdateState?.available === true && currentMaruPluginUpdateState?.repairEligible === true) {
+                    await runMaruPluginUpdate();
+                    return;
+                }
+
                 const targetName =
                     selectedDiscord?.name;
 

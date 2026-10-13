@@ -10206,18 +10206,8 @@ function getMaruPluginUpdateState() {
             "userplugins"
         );
 
-    if (!existsSync(userPluginsRoot)) {
-        return {
-            available: false,
-            state: "not-ready",
-            updateAvailable: false,
-            reason:
-                "Managed Vencord userplugins folder is not ready yet."
-        };
-    }
-
     const installationAssessment = getMaruPluginInstallationAssessment(userPluginsRoot);
-    if (!installationAssessment.updateSafe) {
+    if (!installationAssessment.updateSafe && !installationAssessment.repairEligible) {
         return { available: false, state: "blocked-modified-or-partial", updateAvailable: false, reason: installationAssessment.reason };
     }
 
@@ -10455,6 +10445,8 @@ function getMaruPluginUpdateState() {
                 : "current",
         updateAvailable,
         upgradeEligible: installationAssessment.upgradeEligible,
+        repairEligible: installationAssessment.repairEligible === true,
+        missingFiles: installationAssessment.missingFiles ?? [],
         legacyRelease: installationAssessment.legacyRelease,
         pluginFilesChanged,
         extensionFilesChanged,
@@ -10477,12 +10469,11 @@ async function assertManagedDiscordTargetsClosedForMaruPluginUpdate() {
     const ownershipStates =
         getManagedUninstallStates();
 
-    const managedStates =
-        ownershipStates.filter(
-            state =>
-                state.state === "managed" &&
-                state.eligible === true
-        );
+    const managedStates = ownershipStates.filter(state => state.state === "managed");
+    const unsafeTarget = managedStates.find(state => state.eligible !== true);
+    if (unsafeTarget) {
+        throw new Error(unsafeTarget.reason ?? "Managed Discord target is not safe to modify; plug-in recovery is blocked.");
+    }
 
     const installs =
         detectDiscordInstalls();
@@ -10562,6 +10553,18 @@ async function updateMaruPlugins() {
 
     const targetSafety =
         await assertManagedDiscordTargetsClosedForMaruPluginUpdate();
+
+    const dependencyState = before.repairEligible ? getManagedPluginDependenciesState() : null;
+    if (dependencyState && dependencyState.available !== true) {
+        throw new Error(dependencyState.reason ?? "Plugin recovery cannot safely inspect the managed package.json.");
+    }
+    // Partial legacy setups cannot reach Automatic Setup's tool/dependency
+    // preparation. Reuse those guarded routines here before the verified build.
+    if (before.repairEligible) {
+        await prepareManagedNodeRuntime();
+        await prepareManagedPnpmRuntime();
+    }
+    const dependencyRepairNeeded = dependencyState !== null && dependencyState.state !== "installed";
 
     const timestamp =
         new Date()
@@ -10698,9 +10701,21 @@ async function updateMaruPlugins() {
         ...kickExtensionChanges
     ];
 
+    const dependencyChanges = dependencyRepairNeeded
+        ? ["package.json", "pnpm-lock.yaml"].map(file => {
+            const destinationPath = assertSafePath(join(paths.vencord, file));
+            if (!isRegularNonEmptyFile(destinationPath)) {
+                throw new Error("Plugin recovery requires a valid package.json and lockfile; source integrity must be repaired first.");
+            }
+            const hash = getFileSha256(destinationPath);
+            return { kind: "dependency", component: "Vencord", file, sourcePath: destinationPath,
+                destinationPath, destinationExisted: true, destinationSha256: hash, sourceSha256: hash,
+                backupPath: join(backupRoot, "dependency-files", file) };
+        }) : [];
     const allChanges = [
         ...pluginChanges,
-        ...extensionChanges
+        ...extensionChanges,
+        ...dependencyChanges
     ];
 
     const distPath =
@@ -10904,11 +10919,22 @@ async function updateMaruPlugins() {
                                     change.sourceSha256
                             })
                         ),
+                    dependencyFiles: dependencyChanges.map(change => ({ file: change.file, previousSha256: change.destinationSha256 })),
                     distBackedUp
                 };
         persistTransaction("prepared");
 
         modificationsStarted = true;
+
+        if (dependencyRepairNeeded) {
+            for (const change of dependencyChanges) verifyUnchangedDestination(change);
+            appliedChanges.push(...dependencyChanges);
+            persistTransaction("repairing-dependencies");
+            await installManagedPluginDependencies();
+            if (getManagedPluginDependenciesState().state !== "installed") {
+                throw new Error("Required plugin dependency failed post-repair verification.");
+            }
+        }
 
         for (const change of pluginChanges) {
             verifyUnchangedDestination(change);
@@ -10920,7 +10946,8 @@ async function updateMaruPlugins() {
                 change.sourcePath,
                 change.destinationPath,
                 {
-                    force: true
+                    force: change.destinationExisted,
+                    errorOnExist: !change.destinationExisted
                 }
             );
 
@@ -10973,7 +11000,8 @@ async function updateMaruPlugins() {
                 change.sourcePath,
                 change.destinationPath,
                 {
-                    force: true
+                    force: change.destinationExisted,
+                    errorOnExist: !change.destinationExisted
                 }
             );
 
@@ -13921,9 +13949,11 @@ async function getManagedInstallPlan(
             ) {
                 addBlocker(
                     "partial-plugin-install",
-                    installedPluginsState.upgradeEligible
-                        ? "Verified previous five-plugin release detected. Use Update Maru Plug-ins to add Friends Sidebar safely, then continue setup."
-                        : "Managed plugin installation is incomplete or modified. Automatic setup will not overwrite existing plugin folders."
+                    installedPluginsState.repairEligible
+                        ? installedPluginsState.reason
+                        : installedPluginsState.upgradeEligible
+                            ? "Verified previous five-plugin release detected. Use Update Maru Plug-ins to add Friends Sidebar safely, then continue setup."
+                            : installedPluginsState.reason ?? "Managed plugin installation is incomplete or modified. Automatic setup will not overwrite existing plugin folders."
                 );
             } else if (
                 installedPluginsState.state !== "installed"
