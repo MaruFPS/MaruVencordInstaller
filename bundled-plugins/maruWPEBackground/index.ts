@@ -1,6 +1,6 @@
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
-import { showToast, Toasts } from "@webpack/common";
+import { showToast } from "@webpack/common";
 
 
 const settings = definePluginSettings({
@@ -122,14 +122,7 @@ function showFailureToast(
     lastFailureToastAt =
         now;
 
-    showToast(
-        message,
-        Toasts.Type.FAILURE,
-        {
-            position:
-                Toasts.Position.BOTTOM
-        }
-    );
+    showToast({ text: message, variant: "critical", position: "bottom" });
 }
 
 
