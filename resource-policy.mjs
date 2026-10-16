@@ -1,6 +1,7 @@
-import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, rmdirSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import { dirname, join, parse, resolve } from "node:path";
 import { createHash } from "node:crypto";
+import { createCustomizationHunks, applyCustomizationHunks } from "./source-customizations.mjs";
 
 export function sha256(file) {
     return createHash("sha256").update(readFileSync(file)).digest("hex");
@@ -47,51 +48,68 @@ export function validatePluginBundle(root, registry, policy) {
 }
 
 export function assessInstalledPlugins(root, registry, policy) {
-    const newPlugin = "maruFriendsSidebar";
-    const oldNames = Object.keys(registry).filter(name => name !== newPlugin);
-    const newPath = join(root, newPlugin);
     assertSafePath(root);
-    for (const name of Object.keys(registry)) {
+
+    const missingFiles = [];
+    let missingPluginFolder = false;
+    let survivingFilesCurrent = true;
+
+    for (const [name, files] of Object.entries(registry)) {
+        approvedRelative(name);
         const folder = join(root, name);
         assertSafePath(folder);
-        if (existsSync(folder) && !lstatSync(folder).isDirectory())
-            return { upgradeEligible: false, updateSafe: false, reason: `Plugin path is not a directory: ${name}` };
-    }
-    const matches = files => Object.entries(files).every(([rel, hash]) => regular(join(root, approvedRelative(rel))) && sha256(join(root, rel)) === hash);
-    const legacy = policy.legacyReleases.find(release => {
-        const required = oldNames.flatMap(name => registry[name].map(file => `${name}/${file}`)).sort();
-        return JSON.stringify(required) === JSON.stringify(Object.keys(release.files).sort()) && matches(release.files);
-    });
-    if (!existsSync(newPath) && legacy)
-        return { upgradeEligible: true, updateSafe: true, legacyRelease: legacy.id, reason: "Verified five-plugin release; use Update Maru Plug-ins to add Friends Sidebar." };
-    if (matches(policy.current))
-        return { upgradeEligible: false, updateSafe: true, reason: "Approved six-plugin payload is installed." };
 
-    // Recovery is separate from normal/staged update eligibility. Absent approved
-    // files may be restored when every surviving managed file belongs
-    // to one trusted release. Extra files/plugins are never copied over or removed.
-    const expected = Object.entries(registry).flatMap(([name, files]) => files.map(file => approvedRelative(`${name}/${file}`))).sort();
-    if (JSON.stringify(expected) !== JSON.stringify(Object.keys(policy.current).sort()))
-        throw new Error("Plugin registry and approved payload policy disagree.");
-    const missingFiles = [];
-    const present = [];
-    for (const rel of expected) {
-        const file = join(root, rel);
-        assertSafePath(file);
-        if (!existsSync(file)) missingFiles.push(rel);
-        else if (!regular(file))
-            return { upgradeEligible: false, updateSafe: false, repairEligible: false, reason: `Managed plugin file is not a non-empty regular file: ${rel}. It will not be overwritten.` };
-        else present.push([rel, sha256(file)]);
+        const folderExists = existsSync(folder);
+
+        if (folderExists && !lstatSync(folder).isDirectory()) {
+            return {
+                updateSafe: false,
+                repairEligible: false,
+                reason: `Plugin path is not a directory: ${name}`
+            };
+        }
+
+        if (!folderExists) missingPluginFolder = true;
+
+        for (const nameOfFile of files) {
+            const rel = approvedRelative(`${name}/${nameOfFile}`);
+            const target = join(root, rel);
+            assertSafePath(target);
+
+            if (!existsSync(target)) {
+                missingFiles.push(rel);
+                continue;
+            }
+
+            if (!regular(target)) {
+                return {
+                    updateSafe: false,
+                    repairEligible: false,
+                    reason: `Managed plugin file is not a non-empty regular file: ${rel}`
+                };
+            }
+
+            if (policy.current?.[rel] !== sha256(target)) {
+                survivingFilesCurrent = false;
+            }
+        }
     }
-    const trustedRelease = [
-        { id: "current", files: policy.current },
-        ...policy.legacyReleases
-    ].find(release => present.every(([rel, hash]) => release.files[rel] === hash));
-    if (missingFiles.length && trustedRelease)
-        return { upgradeEligible: false, updateSafe: false, repairEligible: true, missingFiles, recoveryRelease: trustedRelease.id, reason: `${missingFiles.length} approved plugin file(s) are missing; surviving managed files match a trusted release. Use Repair Managed Vencord to restore bundled plugins, then continue Automatic Setup.` };
-    return { upgradeEligible: false, updateSafe: false, repairEligible: false, reason: "Managed plugin files are modified or from an unrecognized release. Repair will not overwrite them. Verified managed Discord patches can still be uninstalled below; the workspace and custom files are kept." };
+
+    const repairEligible =
+        missingFiles.length > 0 &&
+        !missingPluginFolder &&
+        survivingFilesCurrent;
+
+    return {
+        upgradeEligible: false,
+        updateSafe: true,
+        repairEligible,
+        missingFiles,
+        reason: repairEligible
+            ? "Missing managed plugin files can be restored."
+            : "Registered Maru plug-ins can be updated from the current bundle."
+    };
 }
-
 export function copyApprovedPlugin(bundleRoot, destination, name, registry, policy) {
     validatePluginBundle(bundleRoot, registry, policy);
     assertSafePath(destination);
@@ -107,35 +125,119 @@ export function copyApprovedPlugin(bundleRoot, destination, name, registry, poli
     }
 }
 
-export function validateSourceOverrides(sourceRoot, overrideRoot, policy, revision) {
-    if (revision !== policy.overrides.revision)
-        throw new Error(`Source overrides support reviewed Vencord ${policy.overrides.revision}; refusing unreviewed revision ${revision ?? "unknown"}.`);
+export function planSourceOverrides(sourceRoot, overrideRoot, policy) {
     const approved = ["src/components/settings/tabs/themes/LocalThemesTab.tsx", "src/components/settings/tabs/vencord/index.tsx"].sort();
-    if (JSON.stringify(Object.keys(policy.overrides.files).sort()) !== JSON.stringify(approved))
-        throw new Error("Source override policy must contain exactly the two reviewed targets.");
-    for (const rel of approved) {
-        const baseline = join(sourceRoot, rel);
+    if (policy.overrides?.schemaVersion !== 2 || JSON.stringify(Object.keys(policy.overrides.files).sort()) !== JSON.stringify(approved))
+        throw new Error("Source customization policy is missing or unsupported. Rebuild the installer's customization metadata.");
+    return approved.map(rel => {
+        const target = join(sourceRoot, rel);
+        const base = join(overrideRoot, "base", rel);
         const replacement = join(overrideRoot, rel);
         const hashes = policy.overrides.files[rel];
-        if (!regular(baseline) || sha256(baseline) !== hashes.upstreamSha256)
-            throw new Error(`Upstream override target changed; compatibility review required: ${rel}`);
-        if (!regular(replacement) || sha256(replacement) !== hashes.overrideSha256)
-            throw new Error(`Bundled override hash mismatch: ${rel}`);
+        if (!regular(base) || sha256(base) !== hashes.baseSha256) throw new Error(`Bundled customization base hash mismatch: ${rel}`);
+        if (!regular(replacement) || sha256(replacement) !== hashes.overrideSha256) throw new Error(`Bundled customization hash mismatch: ${rel}`);
+        if (!regular(target)) throw new Error(`Required customization target is missing or empty: ${rel}`);
+        const original = readFileSync(target, "utf8");
+        const hunks = createCustomizationHunks(readFileSync(base, "utf8"), readFileSync(replacement, "utf8"));
+        if (!hunks.length) throw new Error(`Bundled customization contains no changes: ${rel}`);
+        const output = applyCustomizationHunks(original, hunks, rel);
+        return { rel, target, original, output };
+    });
+}
+
+export function validateSourceOverrides(sourceRoot, overrideRoot, policy, revision) {
+    // The revision is recorded as provenance, never used as an approval gate.
+    if (!/^[0-9a-f]{40}$/i.test(revision ?? "")) throw new Error("Source customization requires an exact upstream commit identity.");
+    return planSourceOverrides(sourceRoot, overrideRoot, policy).map(plan => plan.rel);
+}
+
+export function assessSourceOverrides(sourceRoot, overrideRoot, policy) {
+    try {
+        const plans = planSourceOverrides(sourceRoot, overrideRoot, policy);
+        const ready = plans.every(plan => plan.original === plan.output);
+        return { ready, compatible: true, reason: ready ? null : "Required source customizations have not all been applied." };
+    } catch (error) {
+        return { ready: false, compatible: false, reason: error?.message ?? String(error) };
     }
-    return approved;
 }
 
 export function applyApprovedOverrides(sourceRoot, overrideRoot, policy, revision) {
-    const approved = validateSourceOverrides(sourceRoot, overrideRoot, policy, revision);
-    for (const rel of approved) {
-        const target = join(sourceRoot, rel);
-        cpSync(join(overrideRoot, rel), target, { force: true });
-        if (sha256(target) !== policy.overrides.files[rel].overrideSha256)
-            throw new Error(`Applied override hash verification failed: ${rel}`);
+    validateSourceOverrides(sourceRoot, overrideRoot, policy, revision);
+    // Preflight both targets before writing either. Callers customize isolated
+    // source, so a conflict cannot replace an active build or discard user data.
+    const plans = planSourceOverrides(sourceRoot, overrideRoot, policy);
+    for (const plan of plans) {
+        if (readFileSync(plan.target, "utf8") !== plan.original) throw new Error(`Customization target changed during preflight: ${plan.rel}`);
     }
-    return { source: overrideRoot, destination: sourceRoot, revision, files: approved };
+    for (const plan of plans) {
+        if (plan.output !== plan.original) writeFileSync(plan.target, plan.output, "utf8");
+        const expected = createHash("sha256").update(plan.output).digest("hex");
+        if (sha256(plan.target) !== expected) throw new Error(`Applied customization verification failed: ${plan.rel}`);
+    }
+    return { source: overrideRoot, destination: sourceRoot, revision, files: plans.map(plan => plan.rel) };
 }
 
+export function listManagedPluginFiles(folder) {
+    assertSafePath(folder);
+
+    if (!existsSync(folder)) return [];
+
+    if (!lstatSync(folder).isDirectory()) {
+        throw new Error(`Managed plugin path is not a directory: ${folder}`);
+    }
+
+    const files = [];
+
+    function scan(directory, prefix = "") {
+        for (const entry of readdirSync(directory, { withFileTypes: true })) {
+            const relative = prefix
+                ? `${prefix}/${entry.name}`
+                : entry.name;
+
+            approvedRelative(relative);
+
+            const full = join(directory, entry.name);
+            assertSafePath(full);
+
+            const info = lstatSync(full);
+
+            if (info.isDirectory()) {
+                scan(full, relative);
+            } else if (info.isFile() && info.size > 0) {
+                files.push(relative);
+            } else {
+                throw new Error(`Unsafe or empty plugin entry: ${relative}`);
+            }
+        }
+    }
+
+    scan(folder);
+    return files.sort();
+}
+export function verifyObsoletePluginFile(change) {
+    assertSafePath(change.destinationPath);
+
+    if (
+        !regular(change.destinationPath) ||
+        sha256(change.destinationPath) !== change.destinationSha256
+    ) {
+        throw new Error(
+            `Obsolete plugin file changed before removal: ${change.component}/${change.file}`
+        );
+    }
+}
+
+export function removeObsoletePluginFile(change) {
+    verifyObsoletePluginFile(change);
+
+    rmSync(change.destinationPath);
+
+    if (existsSync(change.destinationPath)) {
+        throw new Error(
+            `Obsolete plugin file removal failed: ${change.component}/${change.file}`
+        );
+    }
+}
 export function ensureTrackedDirectory(directory, created) {
     assertSafePath(directory);
     if (existsSync(directory)) {

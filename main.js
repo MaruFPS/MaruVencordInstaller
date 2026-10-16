@@ -17,6 +17,7 @@ import {
     dirname,
     join,
     normalize,
+    relative,
     resolve
 } from "path";
 import * as https from "https";
@@ -24,7 +25,9 @@ import { AsyncLocalStorage } from "async_hooks";
 import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import * as originalFs from "original-fs";
-import { applyApprovedOverrides, assessInstalledPlugins, assertSafePath, copyApprovedPlugin, ensureTrackedDirectory, removeCreatedEmptyDirectories, restoreBuildOutput, restoreUpdatedFile, validatePluginBundle, validateSourceOverrides, verifyUnchangedDestination } from "./resource-policy.mjs";
+import { createCustomizationHunks, applyCustomizationHunks } from "./source-customizations.mjs";
+import { Script } from "node:vm";
+import { assessSourceOverrides, planSourceOverrides, applyApprovedOverrides, assessInstalledPlugins, assertSafePath, copyApprovedPlugin, listManagedPluginFiles, verifyObsoletePluginFile, removeObsoletePluginFile, ensureTrackedDirectory, removeCreatedEmptyDirectories, restoreBuildOutput, restoreUpdatedFile, validatePluginBundle, validateSourceOverrides, verifyUnchangedDestination } from "./resource-policy.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -308,42 +311,13 @@ function getInstallerResourcesState() {
 }
 
 
-const BUNDLED_PLUGIN_FILES = {
-    "twitchPresence.desktop": [
-        "index.tsx",
-        "native.ts",
-        "TwitchPanel.tsx"
-    ],
-
-    "kickPresence.desktop": [
-        "index.tsx",
-        "native.ts",
-        "KickPanel.tsx"
-    ],
-
-    "ytmDesktopControls.desktop": [
-        "index.tsx",
-        "native.ts",
-        "PlayerComponent.tsx"
-    ],
-
-    "statusSwitcher": [
-        "index.tsx",
-        "style.css"
-    ],
-    
-    "maruFriendsSidebar": ["index.ts"],
-    "maruWPEBackground": [
-    "index.ts",
-    "native.ts"
-    ]
-};
+const BUNDLED_PLUGIN_FILES = BUNDLE_POLICY.plugins;
 
 function getMaruPluginInstallationAssessment(root) {
     try {
         return assessInstalledPlugins(root, BUNDLED_PLUGIN_FILES, BUNDLE_POLICY);
     } catch (error) {
-        return { upgradeEligible: false, updateSafe: false, reason: error.message };
+        return { updateSafe: false, repairEligible: false, reason: error.message };
     }
 }
 
@@ -1874,6 +1848,15 @@ async function resolveTrustedVencordMainCommit() {
 }
 
 
+async function resolveTrustedVencordRepairCommit(commit) {
+    if (!/^[0-9a-f]{40}$/.test(commit ?? "")) throw new Error("Repair source requires an exact trusted commit identity.");
+    const metadata = await getTrustedGithubJson(`https://api.github.com/repos/${VENCORD_GITHUB_REPOSITORY}/commits/${commit}`);
+    if (metadata?.sha?.toLowerCase() !== commit || !metadata?.html_url?.startsWith("https://github.com/Vendicated/Vencord/"))
+        throw new Error("GitHub did not verify the recorded installed Vencord commit.");
+    return { repository: VENCORD_GITHUB_REPOSITORY, commit, htmlUrl: metadata.html_url, archiveUrl: `https://github.com/Vendicated/Vencord/archive/${commit}.zip` };
+}
+
+
 function downloadTrustedVencordArchive(
     rawUrl,
     destinationPath,
@@ -2281,7 +2264,7 @@ function validateStagedVencordSource(
 }
 
 
-async function acquireVencordSourceArchiveToStaging() {
+async function acquireVencordSourceArchiveToStaging({ commit = null } = {}) {
     const paths =
         getManagedPaths();
 
@@ -2356,7 +2339,7 @@ async function acquireVencordSourceArchiveToStaging() {
     );
 
     const resolvedCommit =
-        await resolveTrustedVencordMainCommit();
+        commit ? await resolveTrustedVencordRepairCommit(commit) : await resolveTrustedVencordMainCommit();
 
     const download =
         await downloadTrustedVencordArchive(
@@ -3034,7 +3017,7 @@ function getLatestValidatedStagedVencordSource() {
 }
 
 
-function promoteStagedVencordSource() {
+function promoteStagedVencordSource({ stagingRoot = null, customize = false } = {}) {
     const paths =
         getManagedPaths();
 
@@ -3057,7 +3040,8 @@ function promoteStagedVencordSource() {
     }
 
     const staged =
-        getLatestValidatedStagedVencordSource();
+        stagingRoot ? inspectStagedVencordSourceCandidate(stagingRoot, join(paths.root, "source-acquisition")) : getLatestValidatedStagedVencordSource();
+    if (staged.valid !== true) throw new Error(staged.reason ?? "The selected source acquisition failed validation.");
 
     if (
         !isPathInsideOrSame(
@@ -3184,6 +3168,12 @@ function promoteStagedVencordSource() {
         }
     }
 
+    // Keep the official acquisition pristine. Customize and verify this exact
+    // prepared copy before the only operation that can activate it.
+    if (customize) applySourceOverridesToStagedSource(preparedPath, staged.commit);
+    const expectedPromotedFiles = customize ? getBackupFileManifest(preparedPath) : staged.sourceFiles;
+    const expectedPromotedTreeSha256 = getFileManifestTreeSha256(expectedPromotedFiles);
+
     // Re-check the destination immediately before the only operation that
     // can activate this source.
     if (
@@ -3224,7 +3214,7 @@ function promoteStagedVencordSource() {
 
     const postVerification =
         verifyBackupFileManifests(
-            staged.sourceFiles,
+            expectedPromotedFiles,
             promotedFiles
         );
 
@@ -3241,7 +3231,7 @@ function promoteStagedVencordSource() {
 
     if (
         promotedTreeSha256 !==
-        staged.sourceTreeSha256
+        expectedPromotedTreeSha256
     ) {
         throw new Error(
             "Managed Vencord source tree hash does not match the validated staged source after promotion."
@@ -4642,13 +4632,13 @@ function isRegularNonEmptyFile(filePath) {
 
 
 function resolveManagedPnpmPackageRuntime(
-    paths
+    paths, runtimeRootOverride = null
 ) {
     if (!paths?.toolchain) {
         return null;
     }
 
-    const runtimeRoot =
+    const runtimeRoot = runtimeRootOverride ??
         join(
             paths.toolchain,
             "pnpm"
@@ -4853,10 +4843,13 @@ function resolveManagedBuildTool(toolName) {
         toolName === "pnpm" &&
         paths?.toolchain
     ) {
-        const managedPnpm =
-            resolveManagedPnpmPackageRuntime(
-                paths
-            );
+        let cachedPnpm = null;
+        try {
+            const requirement = getManagedPackageManagerRequirement();
+            const version = /^pnpm@([0-9A-Za-z.+-]+)$/.exec(requirement.packageManager ?? "")?.[1];
+            if (version) cachedPnpm = resolveManagedPnpmPackageRuntime(paths, join(paths.toolchain, "pnpm-versions", version));
+        } catch { /* Source recovery may be required; retain the existing resolver fallback. */ }
+        const managedPnpm = cachedPnpm ?? resolveManagedPnpmPackageRuntime(paths);
 
         if (managedPnpm) {
             recordManagedToolAudit(
@@ -5116,10 +5109,19 @@ function execResolvedBuildTool(
     options,
     callback
 ) {
-    const tool =
-        resolveManagedBuildTool(
-            toolName
-        );
+    const { managedPnpmRoot = null, ...executionOptions } = options ?? {};
+    let tool;
+    if (managedPnpmRoot) {
+        const paths = getManagedPaths();
+        assertSafePath(managedPnpmRoot);
+        if (toolName !== "pnpm" || !isPathInsideOrSame(paths.toolchain, managedPnpmRoot))
+            throw new Error("Source-specific pnpm runtime is outside the managed toolchain.");
+        tool = resolveManagedPnpmPackageRuntime(paths, managedPnpmRoot);
+        if (!tool) throw new Error("Source-specific managed pnpm failed runtime verification.");
+        recordManagedToolAudit("managedSelections", "pnpm", { command: tool.command, runtimeKind: tool.runtimeKind });
+    } else {
+        tool = resolveManagedBuildTool(toolName);
+    }
 
     if (
         typeof tool.command !== "string" ||
@@ -5132,7 +5134,7 @@ function execResolvedBuildTool(
     }
 
     const execOptions = {
-        ...(options ?? {}),
+        ...executionOptions,
         env:
             getResolvedToolEnvironment(
                 tool,
@@ -5211,8 +5213,13 @@ function runResolvedBuildTool(
                     stderr
                 ) => {
                     if (error) {
+                        const maintenance = managedMaintenanceContext.getStore();
+                        const maintenanceOutput = maintenance ? [...new Set([
+                            stderr?.trim?.(), stdout?.trim?.(), error.message
+                        ].filter(Boolean))].join("\n\n") : null;
                         const wrapped =
                             new Error(
+                                maintenanceOutput ||
                                 stderr?.trim?.() ||
                                 stdout?.trim?.() ||
                                 error.message
@@ -8256,7 +8263,8 @@ function validateExtractedPnpmPackage(
 
 function writeManagedPnpmWrapper(
     wrapperPath,
-    packageBinRelativePath
+    packageBinRelativePath,
+    nodeRelativePath = "..\\node\\node.exe"
 ) {
     const normalizedBin =
         packageBinRelativePath
@@ -8268,7 +8276,7 @@ function writeManagedPnpmWrapper(
     const wrapper = [
         "@echo off",
         "setlocal",
-        'set "MARU_NODE=%~dp0..\\node\\node.exe"',
+        `set "MARU_NODE=%~dp0${nodeRelativePath}"`,
         'if not exist "%MARU_NODE%" (',
         "  echo Managed Node runtime not found. 1>&2",
         "  exit /b 1",
@@ -8288,7 +8296,7 @@ function writeManagedPnpmWrapper(
 }
 
 
-async function prepareManagedPnpmRuntime() {
+async function prepareManagedPnpmRuntime({ sourceRoot = null } = {}) {
     const paths =
         getManagedPaths();
 
@@ -8299,7 +8307,7 @@ async function prepareManagedPnpmRuntime() {
     }
 
     const requirement =
-        getManagedPackageManagerRequirement();
+        sourceRoot ? { available: true, ...getVencordPackageManagerAtSource(sourceRoot) } : getManagedPackageManagerRequirement();
 
     if (
         requirement?.available !== true ||
@@ -8348,6 +8356,7 @@ async function prepareManagedPnpmRuntime() {
     if (
         currentPnpm.available === true &&
         currentPnpm.source === "managed" &&
+        (!sourceRoot || currentPnpm.runtimeKind === "managed-node-script") &&
         currentPnpm.version ===
         requiredVersion
     ) {
@@ -8368,21 +8377,20 @@ async function prepareManagedPnpmRuntime() {
         };
     }
 
-    const target =
-        join(
-            paths.toolchain,
-            "pnpm"
-        );
-
-    if (
-        existsSync(
-            target
-        )
-    ) {
-        throw new Error(
-            `Refusing managed pnpm preparation: ${target} already exists but does not resolve as required pnpm ${requiredVersion}.`
-        );
+    const legacyTarget = join(paths.toolchain, "pnpm");
+    const target = sourceRoot || existsSync(legacyTarget)
+        ? join(paths.toolchain, "pnpm-versions", requiredVersion)
+        : legacyTarget;
+    assertSafePath(target);
+    if (existsSync(target)) {
+        const existing = resolveManagedPnpmPackageRuntime(paths, target);
+        if (!existing || existing.managedPackageVersion !== requiredVersion)
+            throw new Error(`Managed pnpm cache is occupied but does not verify as pnpm ${requiredVersion}: ${target}. It was kept unchanged.`);
+        const version = await runNodeRuntimeProbe(existing.executable, [existing.binPath, "--version"]);
+        if (version.trim() !== requiredVersion) throw new Error("Cached managed pnpm failed its version probe; existing files were kept.");
+        return { ok: true, state: "ready", alreadyPrepared: true, requiredVersion, version: requiredVersion, command: existing.command, target };
     }
+    mkdirSync(dirname(target), { recursive: true });
 
     mkdirSync(
         paths.toolchain,
@@ -8569,7 +8577,8 @@ async function prepareManagedPnpmRuntime() {
 
     writeManagedPnpmWrapper(
         wrapperPath,
-        validation.bin
+        validation.bin,
+        relative(target, managedNode.command)
     );
 
     if (
@@ -8720,10 +8729,10 @@ async function prepareManagedPnpmRuntime() {
         target
     );
 
-    const resolvedPnpm =
-        await inspectManagedBuildTool(
-            "pnpm"
-        );
+    const promotedRuntime = resolveManagedPnpmPackageRuntime(paths, target);
+    const resolvedPnpm = promotedRuntime ? {
+        ...promotedRuntime, available: true, version: preparedVersion
+    } : { available: false };
 
     if (
         resolvedPnpm.available !== true ||
@@ -9512,7 +9521,7 @@ async function prepareManagedVencordSourceFromArchive() {
     validateSourceOverrides(acquisition.stagedSourceRoot, getInstallerResourceDirectory("sourceOverrides").path, BUNDLE_POLICY, acquisition.commit);
 
     const promotion =
-        promoteStagedVencordSource();
+        promoteStagedVencordSource({ stagingRoot: acquisition.stagingRoot, customize: true });
 
     if (
         promotion?.ok !== true ||
@@ -9537,10 +9546,11 @@ async function prepareManagedVencordSourceFromArchive() {
         );
     }
 
-    applySourceOverridesToStagedSource(
-        after.path,
-        promotion.commit
-    );
+    writeManagedVencordSourceMetadata(after.path, {
+        commit: promotion.commit,
+        acquisitionManifestPath: acquisition.manifestPath,
+        customizationBases: Object.fromEntries(planSourceOverrides(acquisition.stagedSourceRoot, getInstallerResourceDirectory("sourceOverrides").path, BUNDLE_POLICY).map(plan => [plan.rel, plan.output]))
+    });
 
     return {
         ok: true,
@@ -10231,6 +10241,13 @@ function getMaruPluginUpdateState() {
                         !file.matches
                 );
 
+            const obsoleteFiles =
+                listManagedPluginFiles(
+                    join(userPluginsRoot, plugin.name)
+                ).filter(file =>
+                    !BUNDLED_PLUGIN_FILES[plugin.name].includes(file)
+                );
+
             return {
                 name:
                     plugin.name,
@@ -10242,11 +10259,12 @@ function getMaruPluginUpdateState() {
                         plugin.name
                     ),
                 updateAvailable:
-                    changedFiles.length > 0,
+                    changedFiles.length > 0 || obsoleteFiles.length > 0,
                 changedFiles:
                     changedFiles.map(
                         file => file.file
                     ),
+                obsoleteFiles,
                 files
             };
         });
@@ -10255,7 +10273,8 @@ function getMaruPluginUpdateState() {
         plugins.reduce(
             (total, plugin) =>
                 total +
-                plugin.changedFiles.length,
+                plugin.changedFiles.length +
+                plugin.obsoleteFiles.length,
             0
         );
 
@@ -10444,10 +10463,10 @@ function getMaruPluginUpdateState() {
                 ? "update-available"
                 : "current",
         updateAvailable,
-        upgradeEligible: installationAssessment.upgradeEligible,
+
         repairEligible: installationAssessment.repairEligible === true,
         missingFiles: installationAssessment.missingFiles ?? [],
-        legacyRelease: installationAssessment.legacyRelease,
+
         pluginFilesChanged,
         extensionFilesChanged,
         twitchExtensionFilesChanged,
@@ -10628,6 +10647,35 @@ async function updateMaruPlugins() {
                     }))
         );
 
+    const obsoleteChanges = before.plugins.flatMap(plugin =>
+        plugin.obsoleteFiles.map(file => {
+            const destinationPath = assertSafePath(
+                join(plugin.destination, file)
+            );
+
+            if (!isRegularNonEmptyFile(destinationPath)) {
+                throw new Error(
+                    `Obsolete plugin file is unavailable: ${plugin.name}/${file}`
+                );
+            }
+
+            return {
+                kind: "plugin-removal",
+                component: plugin.name,
+                file,
+                destinationPath,
+                destinationExisted: true,
+                destinationSha256: getFileSha256(destinationPath),
+                backupPath: join(
+                    backupRoot,
+                    "plugin-files",
+                    plugin.name,
+                    file
+                )
+            };
+        })
+    );
+
     const twitchExtensionChanges =
         before.extension.provisioned
             ? before.extension.files
@@ -10701,7 +10749,7 @@ async function updateMaruPlugins() {
         ...kickExtensionChanges
     ];
 
-    const dependencyChanges = dependencyRepairNeeded
+    const dependencyChanges = (dependencyRepairNeeded || pluginChanges.length > 0 || obsoleteChanges.length > 0)
         ? ["package.json", "pnpm-lock.yaml"].map(file => {
             const destinationPath = assertSafePath(join(paths.vencord, file));
             if (!isRegularNonEmptyFile(destinationPath)) {
@@ -10714,6 +10762,7 @@ async function updateMaruPlugins() {
         }) : [];
     const allChanges = [
         ...pluginChanges,
+        ...obsoleteChanges,
         ...extensionChanges,
         ...dependencyChanges
     ];
@@ -10805,12 +10854,18 @@ async function updateMaruPlugins() {
 
     try {
         for (const change of allChanges) {
-            verifyUnchangedDestination(change);
+            if (change.kind === "plugin-removal") {
+                verifyObsoletePluginFile(change);
+            } else {
+                verifyUnchangedDestination(change);
+            }
+
             assertSafePath(change.backupPath);
             if (
-                !change.sourceSha256 ||
-                !existsSync(
-                    change.sourcePath
+                change.kind !== "plugin-removal" &&
+                (
+                    !change.sourceSha256 ||
+                    !existsSync(change.sourcePath)
                 )
             ) {
                 throw new Error(
@@ -10851,7 +10906,7 @@ async function updateMaruPlugins() {
         }
 
         if (
-            pluginChanges.length > 0 &&
+            (pluginChanges.length > 0 || obsoleteChanges.length > 0) &&
             existsSync(distPath) &&
             statSync(distPath).isDirectory()
         ) {
@@ -10904,6 +10959,12 @@ async function updateMaruPlugins() {
                                     change.sourceSha256
                             })
                         ),
+                    pluginFilesRemoved:
+                        obsoleteChanges.map(change => ({
+                            component: change.component,
+                            file: change.file,
+                            previousSha256: change.destinationSha256
+                        })),
                     browserExtensionFiles:
                         extensionChanges.map(
                             change => ({
@@ -10926,9 +10987,13 @@ async function updateMaruPlugins() {
 
         modificationsStarted = true;
 
-        if (dependencyRepairNeeded) {
+        if (dependencyChanges.length > 0) {
             for (const change of dependencyChanges) verifyUnchangedDestination(change);
             appliedChanges.push(...dependencyChanges);
+            persistTransaction("dependency-files-protected");
+        }
+
+        if (dependencyRepairNeeded) {
             persistTransaction("repairing-dependencies");
             await installManagedPluginDependencies();
             if (getManagedPluginDependenciesState().state !== "installed") {
@@ -10963,11 +11028,64 @@ async function updateMaruPlugins() {
             }
         }
 
-        if (pluginChanges.length > 0) {
+        for (const change of obsoleteChanges) {
+            verifyObsoletePluginFile(change);
+            appliedChanges.push(change);
+            persistTransaction("applying");
+
+            removeObsoletePluginFile(change);
+        }
+
+        if (pluginChanges.length > 0 || obsoleteChanges.length > 0) {
             buildAttempted = true;
             persistTransaction("building");
-            const build =
-                await buildManagedVencord();
+            let build;
+            try {
+                build = await buildManagedVencord();
+            } catch (error) {
+                if (!String(error?.message ?? "").includes("ERR_PNPM_OUTDATED_LOCKFILE")) {
+                    throw error;
+                }
+
+                persistTransaction("repairing-outdated-lockfile");
+
+                const packagePath = assertSafePath(join(paths.vencord, "package.json"));
+                const packageHash = getFileSha256(packagePath);
+                const verification = await verifyManagedPackageManager();
+                const runner = verification.runner;
+                const environment = getManagedVencordBuildEnvironment();
+
+                await runResolvedBuildTool(
+                    runner.toolName,
+                    [
+                        ...runner.argsPrefix,
+                        "--config.confirmModulesPurge=false",
+                        "install",
+                        "--lockfile-only",
+                        "--no-frozen-lockfile",
+                        "--ignore-scripts"
+                    ],
+                    {
+                        cwd: paths.vencord,
+                        windowsHide: true,
+                        timeout: 300000,
+                        env: {
+                            ...environment.env,
+                            CI: "true",
+                            pnpm_config_verify_deps_before_run: "false"
+                        }
+                    }
+                );
+
+                if (getFileSha256(packagePath) !== packageHash) {
+                    throw new Error(
+                        "Lockfile repair unexpectedly modified package.json; restoring transaction backup."
+                    );
+                }
+
+                persistTransaction("retrying-frozen-build");
+                build = await buildManagedVencord();
+            }
 
             if (!build?.ok) {
                 throw new Error(
@@ -11037,6 +11155,8 @@ async function updateMaruPlugins() {
             updated: true,
             pluginFilesUpdated:
                 pluginChanges.length,
+            pluginFilesRemoved:
+                obsoleteChanges.length,
             extensionFilesUpdated:
                 extensionChanges.length,
             twitchExtensionFilesUpdated:
@@ -11087,13 +11207,12 @@ function getManagedPackageManagerRequirement() {
         };
     }
 
-    const packageJson =
-        JSON.parse(
-            readFileSync(
-                packageJsonPath,
-                "utf8"
-            )
-        );
+    let packageJson;
+    try {
+        packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+    } catch (error) {
+        return { available: false, reason: `Managed package.json needs source recovery: ${error?.message ?? error}` };
+    }
 
     const packageManager =
         packageJson.packageManager ?? null;
@@ -13158,6 +13277,7 @@ async function getManagedInstallPlan(
 
     const vencordState =
         getManagedVencordState();
+    const sourceHealth = getManagedSourceHealth();
 
     const userPluginsState =
         getManagedUserPluginsState();
@@ -13172,7 +13292,8 @@ async function getManagedInstallPlan(
         getManagedPluginDependenciesState();
 
     const buildState =
-        getManagedBuildState();
+        getManagedBuildHealth();
+    const customizationState = getManagedCustomizationState();
 
     const patchDetails =
         setupOnly
@@ -13306,11 +13427,11 @@ async function getManagedInstallPlan(
             state:
                 vencordState.state,
             ready:
-                vencordState.state === "repository",
+                vencordState.state === "repository" && sourceHealth.valid === true,
             path:
                 vencordState.path ?? null,
             reason:
-                vencordState.reason ?? null
+                sourceHealth.reason ?? vencordState.reason ?? null
         },
 
         userplugins: {
@@ -13531,6 +13652,8 @@ async function getManagedInstallPlan(
             };
         })(),
 
+        customizations: { ready: customizationState.ready === true, reason: customizationState.reason ?? null },
+
         build: {
             state:
                 buildState.state,
@@ -13700,6 +13823,10 @@ async function getManagedInstallPlan(
         Boolean(discord) &&
         ownershipState?.state === "managed" &&
         patchDetail?.pointsToManaged === true;
+
+    const managedPrerequisitesReady = checks.vencord.ready && checks.userplugins.ready && checks.installedPlugins.ready && checks.dependencies.ready && checks.build.ready && checks.customizations.ready;
+    if (alreadyManaged && !managedPrerequisitesReady && blockers.length === 0)
+        addAction("repair-managed-vencord", "Recover managed Vencord", "Assess and recover source, plugins, or build at the installed commit, then verify the Discord patch.");
 
     const migrationBackupReady =
         !isExternalVencord ||
@@ -13886,6 +14013,10 @@ async function getManagedInstallPlan(
             }
         }
 
+        if (blockers.length === 0 && !repositoryWillChange && willHaveRepository && (!checks.customizations.ready || !checks.vencord.ready)) {
+            addAction("repair-managed-source", "Prepare compatible source customizations", "Prepare the installed commit with checked customizations in staging, preserve local files, then activate a verified build with rollback.");
+        }
+
         let willHaveUserPlugins =
             userPluginsState.state === "ready";
 
@@ -13949,11 +14080,7 @@ async function getManagedInstallPlan(
             ) {
                 addBlocker(
                     "partial-plugin-install",
-                    installedPluginsState.repairEligible
-                        ? installedPluginsState.reason
-                        : installedPluginsState.upgradeEligible
-                            ? "Verified previous five-plugin release detected. Use Update Maru Plug-ins to add Friends Sidebar safely, then continue setup."
-                            : installedPluginsState.reason ?? "Managed plugin installation is incomplete or modified. Automatic setup will not overwrite existing plugin folders."
+                    installedPluginsState.reason ?? "Managed Maru plug-ins need updating. Use Update Maru Plug-ins, then continue setup."
                 );
             } else if (
                 installedPluginsState.state !== "installed"
@@ -14030,25 +14157,12 @@ async function getManagedInstallPlan(
                                     )
                                     : null;
 
-                            if (
-                                managedPnpmPath &&
-                                existsSync(
-                                    managedPnpmPath
-                                )
-                            ) {
-                                addBlocker(
-                                    "managed-pnpm-path-occupied",
-                                    `Managed pnpm path exists at ${managedPnpmPath}, but the resolver did not verify exact managed pnpm ${requiredPnpmVersion}. Automatic setup will not overwrite it.`
-                                );
-                            } else {
-                                addAction(
-                                    "prepare-managed-pnpm-runtime",
-                                    `Prepare managed pnpm ${requiredPnpmVersion}`,
-                                    "Download the exact pnpm version required by managed Vencord from the trusted npm registry, verify its integrity, and run it through Managed Node."
-                                );
-
-                                managedPnpmWillChange = true;
-                            }
+                            addAction(
+                                "prepare-managed-pnpm-runtime",
+                                `Prepare managed pnpm ${requiredPnpmVersion}`,
+                                "Prepare and integrity-verify the exact required managed pnpm version without overwriting any existing runtime."
+                            );
+                            managedPnpmWillChange = true;
                         }
                     }
                 }
@@ -14212,7 +14326,7 @@ async function getManagedInstallPlan(
                     ? "setup-complete"
                     : "setup-required"
                 : alreadyManaged
-                    ? "complete"
+                    ? managedPrerequisitesReady ? "complete" : "setup-required"
                     : isExternalVencord
                         ? "migration-required"
                         : actions.length === 1 &&
@@ -15608,6 +15722,12 @@ async function executeManagedInstallPlanAction(
     discordName
 ) {
     switch (actionId) {
+        case "repair-managed-vencord":
+            return repairManagedVencord(discordName);
+
+        case "repair-managed-source":
+            return repairManagedSource();
+
         case "create-managed-workspace":
             return createManagedWorkspace();
 
@@ -15658,7 +15778,7 @@ async function executeManagedInstallPlanAction(
 }
 
 
-async function runManagedInstallCoordinator(
+async function runManagedInstallCoordinatorSteps(
     discordName
 ) {
     if (
@@ -15844,6 +15964,7 @@ async function runManagedInstallCoordinator(
                 new Date()
                     .toISOString();
 
+            recordManagedMaintenanceStage(action.id, { step: stepNumber, discordName: requestedName });
             let result;
 
             try {
@@ -15980,6 +16101,339 @@ async function runManagedInstallCoordinator(
 
 
 
+const managedMaintenanceContext = new AsyncLocalStorage();
+const activeManagedMaintenance = new Set();
+let managedMaintenanceSequence = 0;
+
+function recordManagedMaintenanceStage(stage, details = {}) {
+    const operation = managedMaintenanceContext.getStore();
+    if (!operation) return;
+    operation.stage = stage;
+    operation.details = details;
+    operation.updatedAt = new Date().toISOString();
+    operation.stages.push({ stage, details, at: operation.updatedAt });
+    try { writeFileSync(operation.logPath, JSON.stringify(operation, null, 2), "utf8"); }
+    catch (error) { operation.logWarning = error?.message ?? String(error); }
+}
+
+async function runManagedMaintenance(operationName, action) {
+    const inherited = managedMaintenanceContext.getStore();
+    if (inherited) return action();
+    const paths = getManagedPaths();
+    if (!paths?.root) throw new Error("Managed workspace is unavailable.");
+    const key = resolve(paths.root).toLowerCase();
+    if (activeManagedMaintenance.has(key)) throw new Error("Another setup, source update, or repair is still running for this workspace.");
+    assertSafePath(paths.logs);
+    mkdirSync(paths.logs, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const operation = {
+        operation: operationName, state: "running", stage: "starting",
+        stages: [],
+        startedAt: new Date().toISOString(),
+        logPath: join(paths.logs, `${operationName}-${timestamp}-${process.pid}-${++managedMaintenanceSequence}.json`)
+    };
+    activeManagedMaintenance.add(key);
+    try {
+        return await managedMaintenanceContext.run(operation, async () => {
+            recordManagedMaintenanceStage("starting");
+            try {
+                const result = await action();
+                operation.state = "complete";
+                recordManagedMaintenanceStage("complete");
+                return { ...result, diagnosticLogPath: operation.logPath };
+            } catch (error) {
+                const failedStage = operation.stage;
+                operation.state = "failed";
+                operation.error = error?.message ?? String(error);
+                operation.stack = error?.stack ?? null;
+                operation.tool = error?.tool ?? null;
+                recordManagedMaintenanceStage(failedStage, operation.details);
+                const logSuffix = operation.logWarning
+                    ? ` Diagnostic log could not be saved: ${operation.logWarning}`
+                    : ` Diagnostic log: ${operation.logPath}`;
+                const wrapped = new Error(`${operationName} failed during ${failedStage}: ${operation.error}${logSuffix}`);
+                if (error?.coordinator) wrapped.coordinator = error.coordinator;
+                throw wrapped;
+            }
+        });
+    } finally { activeManagedMaintenance.delete(key); }
+}
+
+async function ensureManagedMaintenanceNode() {
+    const paths = getManagedPaths();
+    const node = await inspectManagedBuildTool("node");
+    if (node.available && node.source === "managed" && node.version === `v${MANAGED_NODE_VERSION}` && readManagedNodeRuntimeManifest(join(paths.toolchain, "node")).available) return;
+    recordManagedMaintenanceStage("preparing-managed-node");
+    const target = join(paths.toolchain, "node");
+    if (existsSync(target)) {
+        // Reuse the existing verified migration for the exact old node.exe-only
+        // seed. All other occupied paths retain the existing refusal policy.
+        const entries = readdirSync(target, { withFileTypes: true });
+        if (entries.length === 1 && entries[0].isFile() && entries[0].name.toLowerCase() === "node.exe") {
+            await upgradeTemporaryManagedNodeSeedToVerifiedPortableNode();
+            return;
+        }
+    }
+    await prepareManagedNodeRuntime();
+}
+
+function getManagedCustomizationState() {
+    const paths = getManagedPaths();
+    if (!paths || !inspectManagedVencordSourceRoot(paths.vencord).valid) return { ready: false, reason: "Managed source needs recovery before customizations can be checked." };
+    return assessSourceOverrides(paths.vencord, getInstallerResourceDirectory("sourceOverrides").path, BUNDLE_POLICY);
+}
+
+function getManagedBuildHealth() {
+    const state = getManagedBuildState();
+    if (!isManagedBuildReady(state)) return state;
+    try {
+        for (const file of state.files.filter(file => file.name.endsWith(".js"))) {
+            assertSafePath(file.path);
+            // Parse only; never execute a user's installed build in the installer.
+            new Script(readFileSync(file.path, "utf8"), { filename: file.name });
+        }
+        return state;
+    } catch (error) {
+        return { ...state, state: "damaged", complete: false, reason: `Managed JavaScript build output failed validation: ${error?.message ?? error}` };
+    }
+}
+
+async function getManagedRepairSourceIdentity() {
+    const paths = getManagedPaths();
+    const archive = getManagedArchiveVencordBuildMetadata({ allowDamagedSource: true });
+    if (archive.available) return archive;
+    if (existsSync(join(paths.vencord, ".git"))) {
+        const remote = await runResolvedBuildTool("git", ["remote", "get-url", "origin"], { cwd: paths.vencord, windowsHide: true, timeout: 30000 });
+        if (!/^(?:https:\/\/github\.com\/Vendicated\/Vencord(?:\.git)?\/?|git@github\.com:Vendicated\/Vencord(?:\.git)?)$/i.test(remote.stdout.trim()))
+            throw new Error("Managed Git source does not identify the trusted Vencord repository. Existing source was kept.");
+        const result = await runResolvedBuildTool("git", ["rev-parse", "HEAD"], { cwd: paths.vencord, windowsHide: true, timeout: 30000 });
+        const commit = result.stdout.trim().toLowerCase();
+        if (/^[0-9a-f]{40}$/.test(commit)) return { available: true, repository: VENCORD_GITHUB_REPOSITORY, commit, shortCommit: commit.slice(0, 8) };
+    }
+    throw new Error("Cannot recover source safely: no trusted installed commit metadata is available. Existing files and backups were kept; the diagnostic log identifies the failed state.");
+}
+
+function getMaintenanceSourceManifest(root) {
+    if (!existsSync(root)) return [];
+    assertSafePath(root);
+    const ignored = new Set([".git", "node_modules", "dist", MANAGED_VENCORD_SOURCE_METADATA_FILE]);
+    const files = [];
+    const walk = (directory, relative = "") => {
+        for (const entry of readdirSync(directory, { withFileTypes: true })) {
+            if (entry.name === "node_modules" || (!relative && ignored.has(entry.name))) continue;
+            const rel = relative ? `${relative}/${entry.name}` : entry.name;
+            const file = assertSafePath(join(root, rel));
+            if (entry.isDirectory()) walk(file, rel);
+            else if (entry.isFile()) files.push({ path: rel, size: statSync(file).size, sha256: getFileSha256(file) });
+            else throw new Error(`Unsupported redirected or non-file source entry: ${file}`);
+        }
+    };
+    walk(root);
+    return files.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function findRecordedSourceBaseline(commit) {
+    const paths = getManagedPaths();
+    const root = join(paths.root, "source-acquisition");
+    if (existsSync(root)) {
+        for (const entry of readdirSync(root, { withFileTypes: true }).reverse()) {
+            if (!entry.isDirectory()) continue;
+            const candidate = inspectStagedVencordSourceCandidate(join(root, entry.name), root);
+            if (candidate.valid && candidate.commit === commit) return candidate;
+        }
+    }
+    return null;
+}
+
+async function getRecordedSourceBaseline(commit) {
+    const recorded = findRecordedSourceBaseline(commit);
+    if (recorded) return recorded;
+    recordManagedMaintenanceStage("acquiring-installed-source-baseline", { commit });
+    return acquireVencordSourceArchiveToStaging({ commit });
+}
+
+function getManagedSourceHealth() {
+    const paths = getManagedPaths();
+    if (!paths) return { valid: false, reason: "Managed workspace unavailable." };
+    const structural = inspectManagedVencordSourceRoot(paths.vencord);
+    if (!structural.valid) return structural;
+    const identity = getManagedArchiveVencordBuildMetadata();
+    const recorded = identity.available ? findRecordedSourceBaseline(identity.commit) : null;
+    if (!recorded) return { ...structural, integrityCoverage: "required-source-structure" };
+    const missingPaths = getMaintenanceSourceManifest(recorded.stagedSourceRoot).filter(file => {
+        if (file.path.startsWith("src/userplugins/")) return false;
+        const current = assertSafePath(join(paths.vencord, file.path));
+        return !existsSync(current) || !statSync(current).isFile() || (file.size > 0 && statSync(current).size === 0);
+    }).map(file => file.path);
+    return missingPaths.length ? {
+        ...structural, valid: false, missingPaths,
+        reason: `Recorded managed source files are missing or empty: ${missingPaths.join(", ")}`
+    } : { ...structural, integrityCoverage: "recorded-source-presence" };
+}
+
+function stableSourceJson(value) {
+    if (Array.isArray(value)) return value.map(stableSourceJson);
+    if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map(key => [key, stableSourceJson(value[key])]));
+    return value;
+}
+
+function preserveSourceDependencies(oldSource, currentSource, stagedSource) {
+    const currentPath = join(currentSource, "package.json");
+    if (!isRegularNonEmptyFile(currentPath)) return;
+    const base = JSON.parse(readFileSync(join(oldSource, "package.json"), "utf8"));
+    let current;
+    try { current = JSON.parse(readFileSync(currentPath, "utf8")); }
+    catch {
+        recordManagedMaintenanceStage("recovering-damaged-package-metadata", { currentPath, recovery: "Restore from the recorded source; retain the damaged file in the activation backup." });
+        return;
+    }
+    const nextPath = join(stagedSource, "package.json");
+    const next = JSON.parse(readFileSync(nextPath, "utf8"));
+    const fields = ["dependencies", "devDependencies", "optionalDependencies"];
+    const omitDependencies = obj => Object.fromEntries(Object.entries(obj).filter(([key]) => !fields.includes(key)));
+    if (JSON.stringify(stableSourceJson(omitDependencies(base))) !== JSON.stringify(stableSourceJson(omitDependencies(current))))
+        throw new Error("Managed package.json has custom changes outside dependency declarations. Refusing to discard them; the original source was kept for compatibility review.");
+    for (const field of fields) {
+        for (const name of new Set([...Object.keys(base[field] ?? {}), ...Object.keys(current[field] ?? {})])) {
+            const original = base[field]?.[name], installed = current[field]?.[name], upstream = next[field]?.[name];
+            if (installed === original) continue;
+            // Preserve a compatible stronger upstream requirement for the
+            // installer-owned shared dependency rather than downgrading it.
+            if (name === "socket.io-client" && isCompatibleSocketDeclaration(installed) && isCompatibleSocketDeclaration(upstream)) continue;
+            if (upstream !== original && upstream !== installed)
+                throw new Error(`Dependency preservation conflict: ${field}.${name}. Existing source was kept.`);
+            next[field] ??= {};
+            if (installed === undefined) delete next[field][name];
+            else next[field][name] = installed;
+        }
+    }
+    writeFileSync(nextPath, JSON.stringify(next, null, 4) + "\n", "utf8");
+}
+
+async function preserveManagedSourceChanges(currentSource, stagedSource, commit) {
+    const currentFiles = getMaintenanceSourceManifest(currentSource);
+    if (!currentFiles.length) return { files: [], manifest: currentFiles };
+    const baseline = await getRecordedSourceBaseline(commit);
+    recordManagedMaintenanceStage("preserving-user-source-changes", { currentSource, stagedSource, commit });
+    const oldSource = baseline.stagedSourceRoot;
+    const oldFiles = new Map(getMaintenanceSourceManifest(oldSource).map(file => [file.path, file]));
+    const overrideRoot = getInstallerResourceDirectory("sourceOverrides").path;
+    const recordedCustomizations = readManagedVencordSourceMetadata(currentSource).customizationBases;
+    let fallbackCustomizations = null;
+    const oldCustomization = new Map(Object.keys(BUNDLE_POLICY.overrides.files).map(rel => {
+        const recorded = recordedCustomizations?.[rel];
+        if (recorded !== undefined && typeof recorded !== "string") throw new Error(`Invalid recorded customization base: ${rel}`);
+        if (recorded !== undefined) return [rel, recorded];
+        fallbackCustomizations ??= new Map(planSourceOverrides(oldSource, overrideRoot, BUNDLE_POLICY).map(plan => [plan.rel, plan.output]));
+        return [rel, fallbackCustomizations.get(rel)];
+    }));
+    const preserved = [];
+    preserveSourceDependencies(oldSource, currentSource, stagedSource);
+    for (const file of currentFiles) {
+        if (file.path.startsWith("src/userplugins/") || file.path === "package.json" || file.path === "pnpm-lock.yaml") continue;
+        const original = oldFiles.get(file.path);
+        const currentPath = join(currentSource, file.path);
+        const target = assertSafePath(join(stagedSource, file.path));
+        if (!original) {
+            if (existsSync(target) && getFileSha256(target) !== file.sha256) throw new Error(`New upstream file conflicts with a preserved user file: ${file.path}`);
+            if (!existsSync(target)) { mkdirSync(dirname(target), { recursive: true }); cpSync(currentPath, target, { force: false, errorOnExist: true }); }
+            preserved.push(file.path);
+            continue;
+        }
+        const oldText = oldCustomization.get(file.path);
+        if (oldText !== undefined) {
+            const current = readFileSync(currentPath, "utf8");
+            // Preserve extra edits beyond the installer-owned customization.
+            // If the old file was never customized, apply only the required
+            // installer customization to the new source.
+            const base = readFileSync(join(oldSource, file.path), "utf8");
+            if (current.replace(/\r\n/g, "\n") === base.replace(/\r\n/g, "\n")) continue;
+            if (current.replace(/\r\n/g, "\n") === oldText.replace(/\r\n/g, "\n")) continue;
+            const patched = applyCustomizationHunks(readFileSync(target, "utf8"), createCustomizationHunks(oldText, current), file.path);
+            writeFileSync(target, patched, "utf8");
+            preserved.push(file.path);
+        } else if (file.sha256 !== original.sha256) {
+            if (!isRegularNonEmptyFile(target)) throw new Error(`Modified source file no longer exists upstream: ${file.path}. Existing files were kept.`);
+            const oldBytes = readFileSync(join(oldSource, file.path));
+            const currentBytes = readFileSync(currentPath);
+            if (oldBytes.includes(0) || currentBytes.includes(0)) throw new Error(`Modified binary source needs compatibility review: ${file.path}`);
+            const patched = applyCustomizationHunks(readFileSync(target, "utf8"), createCustomizationHunks(oldBytes.toString("utf8"), currentBytes.toString("utf8")), file.path);
+            writeFileSync(target, patched, "utf8");
+            preserved.push(file.path);
+        }
+    }
+    return { files: preserved, manifest: currentFiles };
+}
+
+function restoreMissingBundledFilesForRepair(stagedSourceRoot) {
+    const root = join(stagedSourceRoot, "src", "userplugins");
+    const assessment = getMaruPluginInstallationAssessment(root);
+    if (!assessment.repairEligible) return;
+    const bundle = getBundledPluginsState();
+    validatePluginBundle(bundle.root, BUNDLED_PLUGIN_FILES, BUNDLE_POLICY);
+    for (const rel of assessment.missingFiles) {
+        const destination = assertSafePath(join(root, rel));
+        if (existsSync(destination)) throw new Error(`Missing plugin file appeared during repair: ${rel}`);
+        mkdirSync(dirname(destination), { recursive: true });
+        cpSync(join(bundle.root, rel), destination, { force: false, errorOnExist: true });
+    }
+}
+
+function verifyPreservedSourceFiles(sourceRoot, files) {
+    for (const file of files) {
+        const target = assertSafePath(join(sourceRoot, file.path));
+        if (!existsSync(target) || !statSync(target).isFile() || statSync(target).size !== file.size || getFileSha256(target) !== file.sha256)
+            throw new Error(`Preserved source or customization changed during preparation: ${file.path}. Activation was refused or rolled back.`);
+    }
+    const customizations = assessSourceOverrides(sourceRoot, getInstallerResourceDirectory("sourceOverrides").path, BUNDLE_POLICY);
+    if (!customizations.ready) throw new Error(customizations.reason ?? "Required source customizations failed post-build verification.");
+}
+
+async function updateManagedVencord() {
+    return runManagedMaintenance("managed-vencord-update", () => replaceManagedVencordSource());
+}
+
+async function repairManagedSource() {
+    const identity = await getManagedRepairSourceIdentity();
+    return replaceManagedVencordSource({ repair: true, identity });
+}
+
+async function repairManagedVencord(discordName) {
+    return runManagedMaintenance("managed-vencord-repair", async () => {
+        recordManagedMaintenanceStage("assessing-repair");
+        const ownership = getManagedUninstallStates().find(state => state.name === discordName);
+        if (ownership?.state !== "managed" || ownership.eligible !== true) throw new Error(ownership?.reason ?? "Repair requires a verified managed Discord installation.");
+        await assertManagedDiscordTargetsClosedForSourceUpdate();
+        const paths = getManagedPaths();
+        const source = getManagedSourceHealth();
+        const build = getManagedBuildHealth();
+        const plugins = getManagedInstalledPluginsState();
+        const dependencies = getManagedPluginDependenciesState();
+        const customization = getManagedCustomizationState();
+        recordManagedMaintenanceStage("assessing-repair", {
+            source: source.valid ? "ready" : source.reason,
+            build: build.state,
+            buildReason: build.reason ?? null,
+            incompleteArtifacts: build.files?.filter(file => !file.exists || !file.nonEmpty).map(file => file.name) ?? [],
+            plugins: plugins.state,
+            dependency: dependencies.state,
+            customizations: customization.reason ?? "ready"
+        });
+        let recovery = null;
+        if (!source.valid || !isManagedBuildReady(build) || plugins.state !== "installed" || dependencies.state !== "installed" || !customization.ready) recovery = await repairManagedSource();
+        await ensureManagedMaintenanceNode();
+        recordManagedMaintenanceStage("repairing-discord-patch", { discordName });
+        const patch = await repairManagedDiscordPatch(discordName);
+        if (!isManagedBuildReady(getManagedBuildHealth())) throw new Error("Repair verification found incomplete or damaged build output after Discord patch repair.");
+        return { ...patch, recoveredSource: Boolean(recovery), recovery, reason: recovery ? "Managed source and build recovered at the installed commit; Discord patch verified." : "Existing complete build preserved; Discord patch repaired and verified." };
+    });
+}
+
+async function runManagedInstallCoordinator(discordName) {
+    return runManagedMaintenance("automatic-setup", () => runManagedInstallCoordinatorSteps(discordName));
+}
+
+
 function readManagedVencordSourceMetadata(
     sourceRoot
 ) {
@@ -16050,7 +16504,9 @@ function readManagedVencordSourceMetadata(
         acquisitionManifestPath:
             metadata.acquisitionManifestPath ?? null,
         updateManifestPath:
-            metadata.updateManifestPath ?? null
+            metadata.updateManifestPath ?? null,
+        customizationBases:
+            metadata.customizationBases ?? null
     };
 }
 
@@ -16088,7 +16544,9 @@ function writeManagedVencordSourceMetadata(
         acquisitionManifestPath:
             details?.acquisitionManifestPath ?? null,
         updateManifestPath:
-            details?.updateManifestPath ?? null
+            details?.updateManifestPath ?? null,
+        customizationBases:
+            details?.customizationBases ?? null
     };
 
     writeFileSync(
@@ -16108,7 +16566,7 @@ function writeManagedVencordSourceMetadata(
 }
 
 
-function getManagedArchiveVencordBuildMetadata() {
+function getManagedArchiveVencordBuildMetadata({ allowDamagedSource = false } = {}) {
     const paths =
         getManagedPaths();
 
@@ -16124,8 +16582,8 @@ function getManagedArchiveVencordBuildMetadata() {
         getManagedVencordState();
 
     if (
-        vencordState.state !== "repository" ||
-        vencordState.sourceType !== "archive"
+        !allowDamagedSource && (vencordState.state !== "repository" ||
+        vencordState.sourceType !== "archive")
     ) {
         return {
             available: false,
@@ -16555,51 +17013,27 @@ function getVencordPackageManagerAtSource(
 }
 
 
-async function resolveVencordPnpmRunnerAtSource(
-    sourceRoot
-) {
-    const requirement =
-        getVencordPackageManagerAtSource(
-            sourceRoot
-        );
-
-    const runner =
-        await resolveManagedPnpmRunner(
-            requirement.requiredVersion
-        );
-
-    const versionResult =
-        await runResolvedBuildTool(
-            runner.toolName,
-            [
-                ...runner.argsPrefix,
-                "--version"
-            ],
-            {
-                cwd:
-                    sourceRoot,
-                windowsHide: true,
-                timeout: 30000
-            }
-        );
-
-    const resolvedVersion =
-        versionResult.stdout.trim();
-
-    if (
-        resolvedVersion !==
-        requirement.requiredVersion
-    ) {
-        throw new Error(
-            `Staged Vencord requires pnpm ${requirement.requiredVersion}, but the resolved runner returned ${resolvedVersion || "no version"}.`
-        );
-    }
-
-    return {
-        ...requirement,
-        runner,
-        resolvedVersion
+async function resolveVencordPnpmRunnerAtSource(sourceRoot) {
+    const requirement = getVencordPackageManagerAtSource(sourceRoot);
+    await ensureManagedMaintenanceNode();
+    const paths = getManagedPaths();
+    const select = () => {
+        const cached = resolveManagedPnpmPackageRuntime(paths, join(paths.toolchain, "pnpm-versions", requirement.requiredVersion));
+        const legacy = resolveManagedPnpmPackageRuntime(paths);
+        return cached?.managedPackageVersion === requirement.requiredVersion ? cached : legacy?.managedPackageVersion === requirement.requiredVersion ? legacy : null;
     };
+    let runtime = select();
+    if (!runtime) {
+        recordManagedMaintenanceStage("preparing-staged-pnpm", { sourceRoot, requiredVersion: requirement.requiredVersion });
+        await prepareManagedPnpmRuntime({ sourceRoot });
+        runtime = select();
+    }
+    if (!runtime) throw new Error("The source-specific managed pnpm runtime was not verified after preparation.");
+    const runner = { toolName: "pnpm", argsPrefix: [], source: "managed", command: runtime.command,
+        executionOptions: { managedPnpmRoot: dirname(runtime.manifestPath) } };
+    const probe = await runResolvedBuildTool(runner.toolName, ["--version"], { ...runner.executionOptions, cwd: sourceRoot, windowsHide: true, timeout: 30000 });
+    if (probe.stdout.trim() !== requirement.requiredVersion) throw new Error(`Staged source requires pnpm ${requirement.requiredVersion}; its managed runtime returned ${probe.stdout || "no version"}.`);
+    return { ...requirement, runner, resolvedVersion: probe.stdout.trim() };
 }
 
 
@@ -16952,45 +17386,34 @@ function ensureBundledPluginsInStagedSource(
 }
 
 
-async function installRequiredDependencyAtSource(
-    sourceRoot
-) {
-    const verification =
-        await resolveVencordPnpmRunnerAtSource(
-            sourceRoot
-        );
+function isCompatibleSocketDeclaration(declaration) {
+    const match = /^(?:\^)?(\d+)\.(\d+)\.(\d+)$/.exec(declaration ?? "");
+    return Boolean(match && Number(match[1]) === 4 && (Number(match[2]) > 8 || (Number(match[2]) === 8 && Number(match[3]) >= 3)));
+}
 
-    const dependency =
-        "socket.io-client@^4.8.3";
-
-    const result =
-        await runResolvedBuildTool(
-            verification.runner.toolName,
-            [
-                ...verification.runner.argsPrefix,
-                "add",
-                "-w",
-                dependency
-            ],
-            {
-                cwd:
-                    sourceRoot,
-                windowsHide: true,
-                timeout: 300000
-            }
-        );
-
-    return {
-        dependency,
-        packageManager:
-            verification.packageManager,
-        packageManagerSource:
-            verification.runner.source,
-        output:
-            result.stdout,
-        warnings:
-            result.stderr
-    };
+async function installRequiredDependencyAtSource(sourceRoot) {
+    const verification = await resolveVencordPnpmRunnerAtSource(sourceRoot);
+    const dependency = "socket.io-client@^4.8.3";
+    const packagePath = join(sourceRoot, "package.json");
+    const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
+    const declared = packageJson.dependencies?.["socket.io-client"] ?? packageJson.devDependencies?.["socket.io-client"] ?? null;
+    const keepDeclaration = isCompatibleSocketDeclaration(declared);
+    if (declared && !keepDeclaration && !/^\^?4\.\d+\.\d+$/.test(declared))
+        throw new Error(`Bundled plugins require socket.io-client ^4.8.3, but the staged source declares ${declared}. Refusing to replace an incompatible upstream or user dependency.`);
+    recordManagedMaintenanceStage("preparing-plugin-dependency-lockfile", { sourceRoot, dependency, declared, keepDeclaration });
+    const packageHash = getFileSha256(packagePath);
+    const args = keepDeclaration
+        ? ["--config.confirmModulesPurge=false", "install", "--lockfile-only", "--no-frozen-lockfile", "--ignore-scripts"]
+        : ["--config.confirmModulesPurge=false", "add", "-w", dependency];
+    const result = await runResolvedBuildTool(verification.runner.toolName, [...verification.runner.argsPrefix, ...args], {
+        ...verification.runner.executionOptions,
+        cwd: sourceRoot, windowsHide: true, timeout: 300000,
+        env: { CI: "true", pnpm_config_verify_deps_before_run: "false" }
+    });
+    if (keepDeclaration && getFileSha256(packagePath) !== packageHash)
+        throw new Error("Staged lockfile preparation unexpectedly changed package.json. Existing managed source was kept.");
+    return { dependency, packageManager: verification.packageManager, packageManagerSource: verification.runner.source,
+        output: result.stdout, warnings: result.stderr };
 }
 
 
@@ -17003,22 +17426,33 @@ async function buildVencordAtSource(
             sourceRoot
         );
 
+    recordManagedMaintenanceStage("installing-workspace-dependencies", { sourceRoot });
+    await runResolvedBuildTool(verification.runner.toolName, [
+        ...verification.runner.argsPrefix, "--config.confirmModulesPurge=false", "install", "--frozen-lockfile"
+    ], { ...verification.runner.executionOptions, cwd: sourceRoot, windowsHide: true, timeout: 600000, env: {
+        CI: "true", pnpm_config_verify_deps_before_run: "false",
+        VENCORD_HASH: commit.slice(0, 8), VENCORD_REMOTE: VENCORD_GITHUB_REPOSITORY
+    } });
+    recordManagedMaintenanceStage("building-staged-source", { sourceRoot, commit });
     const result =
         await runResolvedBuildTool(
             verification.runner.toolName,
             [
                 ...verification.runner.argsPrefix,
+                "--config.confirmModulesPurge=false",
                 "run",
                 "build",
                 "--",
                 "--disable-updater"
             ],
             {
+                ...verification.runner.executionOptions,
                 cwd:
                     sourceRoot,
                 windowsHide: true,
                 timeout: 600000,
                 env: {
+                    CI: "true", pnpm_config_verify_deps_before_run: "false",
                     VENCORD_HASH:
                         commit.slice(0, 8),
                     VENCORD_REMOTE:
@@ -17133,7 +17567,7 @@ async function assertManagedDiscordTargetsClosedForSourceUpdate() {
 }
 
 
-async function updateManagedVencord() {
+async function replaceManagedVencordSource({ repair = false, identity = null } = {}) {
     const paths =
         getManagedPaths();
 
@@ -17143,8 +17577,11 @@ async function updateManagedVencord() {
         );
     }
 
-    const before =
-        await getManagedVencordUpdateState();
+    recordManagedMaintenanceStage("checking-source-state");
+    const before = repair ? {
+        available: true, currentCommit: identity.commit, currentShortCommit: identity.commit.slice(0, 8),
+        updateAvailable: true, sourceType: getManagedVencordState().sourceType
+    } : await getManagedVencordUpdateState();
 
     if (
         before.available !== true ||
@@ -17213,8 +17650,8 @@ async function updateManagedVencord() {
         }
     );
 
-    const acquisition =
-        await acquireVencordSourceArchiveToStaging();
+    recordManagedMaintenanceStage("acquiring-source", { updateRoot, repair, commit: repair ? before.currentCommit : "upstream-main" });
+    const acquisition = await acquireVencordSourceArchiveToStaging({ commit: repair ? before.currentCommit : null });
 
     if (
         acquisition?.ok !== true ||
@@ -17230,7 +17667,7 @@ async function updateManagedVencord() {
     }
 
     if (
-        acquisition.commit ===
+        !repair && acquisition.commit ===
         before.currentCommit &&
         before.policyRefreshRequired !== true
     ) {
@@ -17247,6 +17684,7 @@ async function updateManagedVencord() {
         };
     }
 
+    recordManagedMaintenanceStage("copying-official-source", { stagedManagedPath });
     cpSync(
         acquisition.stagedSourceRoot,
         stagedManagedPath,
@@ -17279,11 +17717,18 @@ async function updateManagedVencord() {
         );
     }
 
+    recordManagedMaintenanceStage("applying-customizations", { stagedManagedPath, commit: acquisition.commit });
     applySourceOverridesToStagedSource(
         stagedManagedPath,
         acquisition.commit
     );
 
+    recordManagedMaintenanceStage("preserving-user-source-changes", { stagedManagedPath });
+    const sourcePreservation = await preserveManagedSourceChanges(paths.vencord, stagedManagedPath, before.currentCommit);
+    const preservedSourceFiles = [...new Set([...sourcePreservation.files, ...Object.keys(BUNDLE_POLICY.overrides.files)])].map(path => {
+        const file = join(stagedManagedPath, path);
+        return { path, size: statSync(file).size, sha256: getFileSha256(file) };
+    });
     const currentUserPluginsPath =
         join(
             paths.vencord,
@@ -17305,11 +17750,14 @@ async function updateManagedVencord() {
             "managed userplugins"
         );
 
+    if (repair) restoreMissingBundledFilesForRepair(stagedManagedPath);
+    recordManagedMaintenanceStage("verifying-staged-plugins", { stagedManagedPath });
     const bundledPlugins =
         ensureBundledPluginsInStagedSource(
             stagedManagedPath
         );
 
+    recordManagedMaintenanceStage("preparing-plugin-dependency", { stagedManagedPath });
     const dependency =
         await installRequiredDependencyAtSource(
             stagedManagedPath
@@ -17320,6 +17768,9 @@ async function updateManagedVencord() {
             stagedManagedPath,
             acquisition.commit
         );
+
+    recordManagedMaintenanceStage("verifying-staged-customizations", { stagedManagedPath });
+    verifyPreservedSourceFiles(stagedManagedPath, preservedSourceFiles);
 
     const stagedUserPluginManifest =
         existsSync(stagedUserPluginsPath)
@@ -17389,6 +17840,9 @@ async function updateManagedVencord() {
                 userPluginPreservation.totalBytes
         },
         bundledPlugins,
+        preservedSourceFiles: sourcePreservation.files,
+        preservedSourceManifest: preservedSourceFiles,
+        operation: repair ? "repair" : "update",
         dependency: {
             name:
                 dependency.dependency,
@@ -17429,12 +17883,15 @@ async function updateManagedVencord() {
                 acquisition.commit,
             acquisitionManifestPath:
                 acquisition.manifestPath,
-            updateManifestPath
+            updateManifestPath,
+            customizationBases: Object.fromEntries(planSourceOverrides(acquisition.stagedSourceRoot, getInstallerResourceDirectory("sourceOverrides").path, BUNDLE_POLICY).map(plan => [plan.rel, plan.output]))
         }
     );
 
-    const beforeSwap =
-        await getManagedVencordUpdateState();
+    recordManagedMaintenanceStage("verifying-before-activation", { stagedManagedPath });
+    const beforeSwap = repair ? { available: true, currentCommit: (await getManagedRepairSourceIdentity()).commit } : await getManagedVencordUpdateState();
+    if (!verifyBackupFileManifests(sourcePreservation.manifest, getMaintenanceSourceManifest(paths.vencord)).verified)
+        throw new Error("Managed source or user plugins changed during staging. Activation was refused; the existing installation and staged build were kept.");
 
     if (
         beforeSwap.available !== true ||
@@ -17525,11 +17982,11 @@ async function updateManagedVencord() {
     };
 
     try {
-        renameSync(
-            paths.vencord,
-            backupPath
-        );
-        oldMoved = true;
+        recordManagedMaintenanceStage("activating-verified-source", { stagedManagedPath, backupPath });
+        if (existsSync(paths.vencord)) {
+            renameSync(paths.vencord, backupPath);
+            oldMoved = true;
+        }
 
         renameSync(
             stagedManagedPath,
@@ -17566,6 +18023,8 @@ async function updateManagedVencord() {
 
         const activatedBuildState =
             getManagedBuildState();
+
+        verifyPreservedSourceFiles(paths.vencord, preservedSourceFiles);
 
         if (
             activatedBuildState.state !== "built" ||
@@ -17661,7 +18120,7 @@ async function updateManagedVencord() {
         updateManifest.activatedAt =
             new Date().toISOString();
         updateManifest.rollbackBackupPath =
-            backupPath;
+            oldMoved ? backupPath : null;
 
         writeFileSync(
             updateManifestPath,
@@ -17673,8 +18132,7 @@ async function updateManagedVencord() {
             "utf8"
         );
 
-        const finalState =
-            await getManagedVencordUpdateState();
+        const finalState = repair ? { currentCommit: acquisition.commit, sourceType: "archive" } : await getManagedVencordUpdateState();
 
         return {
             ok: true,
@@ -17689,7 +18147,7 @@ async function updateManagedVencord() {
                 acquisition.commit.slice(0, 8),
             sourceType:
                 "archive",
-            backupPath,
+            backupPath: oldMoved ? backupPath : null,
             updateManifestPath,
             acquisitionManifestPath:
                 acquisition.manifestPath,
@@ -18760,7 +19218,7 @@ async function uninstallManagedVencord(discordName) {
 }
 
 
-async function repairManagedVencord(discordName) {
+async function repairManagedDiscordPatch(discordName) {
     if (
         typeof discordName !== "string" ||
         discordName.length === 0

@@ -1345,6 +1345,9 @@
                 Update Managed Vencord
             </button>
 
+            <div id="managed-vencord-operation-status" role="status" aria-live="polite"
+                style="margin-top: 10px; color: #aaa; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;"></div>
+
             <button
                 id="repair-managed-vencord-button"
                 type="button"
@@ -1724,6 +1727,9 @@
             document.getElementById(
                 "update-managed-vencord-button"
             );
+
+        const managedVencordOperationStatus = document.getElementById("managed-vencord-operation-status");
+        let managedRepairInProgress = false;
 
         const repairManagedVencordButton =
             document.getElementById(
@@ -2998,7 +3004,11 @@
             updateAutomaticSetupButton();
 
             managedInstallPlanSection.style.display =
-                "block";
+                isPackagedRuntime() &&
+                plan?.alreadyManaged === true &&
+                plan?.status === "complete"
+                    ? "none"
+                    : "block";
 
             if (!plan) {
                 managedInstallPlanStatus.textContent =
@@ -3051,7 +3061,7 @@
                 document.createElement("div");
 
             summary.textContent =
-                `Status: ${presentation.label}`;
+                `Status: ${plan.alreadyManaged && plan.status === "setup-required" ? "Maintenance required" : presentation.label}`;
 
             summary.style.cssText = `
                 color: ${presentation.color};
@@ -3076,6 +3086,22 @@
                 managedInstallPlanStatus.appendChild(
                     complete
                 );
+
+                for (const [key, label] of [
+                    ["vencord", "Managed source"],
+                    ["userplugins", "Plugin directory"],
+                    ["installedPlugins", "Maru plugins"],
+                    ["dependencies", "Plugin dependencies"],
+                    ["build", "Managed build"],
+                    ["customizations", "Customizations"]
+                ]) {
+                    const check = plan.checks?.[key];
+                    if (!check || check.ready !== false) continue;
+                    const detail = document.createElement("div");
+                    detail.textContent = `${label}: ${check.reason ?? `requires attention (${check.state ?? "not ready"})`}`;
+                    detail.style.cssText = "color: #fee75c; margin-top: 6px;";
+                    managedInstallPlanStatus.appendChild(detail);
+                }
             }
 
             if (
@@ -3799,20 +3825,23 @@
         function updateRepairManagedVencordButton() {
             const ownership = currentManagedUninstallStates.find(state => state.name === selectedDiscord?.name);
             const pluginRepair = currentMaruPluginUpdateState?.available === true && currentMaruPluginUpdateState?.repairEligible === true;
-            const patchRepair = Boolean(selectedDiscord) && currentManagedBuildState === "built" && ownership?.state === "managed" && ownership?.eligible === true;
+            const managedRepair = Boolean(selectedDiscord) && ownership?.state === "managed" && ownership?.eligible === true;
             const show = currentVencordState === "repository" || ownership?.state === "managed";
             repairManagedVencordButton.style.display = show ? "inline-block" : "none";
-            repairManagedVencordButton.disabled = maruPluginUpdateInProgress || !(pluginRepair || patchRepair);
-            repairManagedVencordButton.textContent = pluginRepair ? "Repair Missing Maru Plug-ins" : "Repair Managed Vencord";
-            if (show && !(pluginRepair || patchRepair)) {
-                repairManagedVencordStatus.textContent = currentMaruPluginUpdateState?.available === false
-                    ? currentMaruPluginUpdateState.reason
-                    : currentManagedBuildState !== "built"
-                        ? "Discord patch repair needs a completed build. Restore missing plugins first, then continue Automatic Setup."
-                        : ownership?.reason ?? "Select a verified managed Discord installation for patch repair.";
-                repairManagedVencordStatus.style.color = "#fee75c";
-            } else if (!show) repairManagedVencordStatus.textContent = "";
+            repairManagedVencordButton.disabled = managedRepairInProgress || maruPluginUpdateInProgress || !(pluginRepair || managedRepair);
+            repairManagedVencordButton.textContent = managedRepairInProgress ? "Repairing Managed Vencord..." : pluginRepair ? "Repair Missing Maru Plug-ins" : "Repair Managed Vencord";
+            // Availability is separate from the persistent operation result.
+            // Always replace an old warning when the current state is ready.
+            repairManagedVencordStatus.textContent = !show ? "" : pluginRepair
+                ? "Missing Maru plug-in files can be restored using plug-in recovery."
+                : managedRepair
+                    ? currentManagedBuildState === "built"
+                        ? "Repair will assess the managed files and verify the Discord patch."
+                        : "Repair can recover managed source or incomplete build output, then verify the Discord patch."
+                    : ownership?.reason ?? "Select a verified managed Discord installation for repair.";
+            repairManagedVencordStatus.style.color = pluginRepair || managedRepair ? "#aaa" : "#fee75c";
         }
+
 
         function updateUninstallManagedVencordButton() {
             const ownership = currentManagedUninstallStates.find(state => state.name === selectedDiscord?.name);
@@ -4407,8 +4436,7 @@
 
             updateMaruPluginsButton.disabled =
                 !canUpdate;
-            updateMaruPluginsButton.textContent = currentMaruPluginUpdateState?.repairEligible
-                ? "Restore Missing Maru Plug-ins" : "Update Maru Plug-ins";
+            updateMaruPluginsButton.textContent = "Update Maru Plug-ins";
             updateRepairManagedVencordButton();
         }
 
@@ -4475,11 +4503,7 @@
                 }
 
                 maruPluginUpdateStatus.textContent =
-                    updateState.repairEligible
-                        ? "Missing Maru plug-in files can be restored safely. Use Repair Missing Maru Plug-ins below; surviving files match approved release hashes. A verified backup and rebuild are required, then continue Automatic Setup."
-                        : updateState.upgradeEligible
-                            ? "Friends Sidebar upgrade ready — verified previous five-plugin release. Use Update Maru Plug-ins, then continue setup."
-                            : `↑ Maru Plug-ins Update Detected${details.length > 0 ? ` — ${details.join(" + ")}` : ""}.`;
+                    `↑ Maru Plug-ins Update Detected${details.length > 0 ? ` — ${details.join(" + ")}` : ""}.`;
 
                 maruPluginUpdateStatus.style.color =
                     "#fee75c";
@@ -6746,10 +6770,10 @@
                     updateState.available !== true ||
                     updateState.updateAvailable !== true
                 ) {
-                    managedVencordUpdateStatus.textContent =
+                    managedVencordOperationStatus.textContent =
                         "Update refused: run the Vencord update check first.";
 
-                    managedVencordUpdateStatus.style.color =
+                    managedVencordOperationStatus.style.color =
                         "#f23f42";
 
                     updateManagedVencordUpdateButton();
@@ -6768,10 +6792,10 @@
                     );
 
                 if (!confirmed) {
-                    managedVencordUpdateStatus.textContent =
+                    managedVencordOperationStatus.textContent =
                         "Vencord update cancelled.";
 
-                    managedVencordUpdateStatus.style.color =
+                    managedVencordOperationStatus.style.color =
                         "#aaa";
                     return;
                 }
@@ -6785,12 +6809,12 @@
                 updateManagedVencordButton.textContent =
                     "Updating Managed Vencord...";
 
-                managedVencordUpdateStatus.textContent =
+                managedVencordOperationStatus.textContent =
                     isPolicyRefresh
                         ? "Preparing the managed build refresh in isolation. Download, dependency installation, and rebuild can take a few minutes..."
                         : "Preparing the trusted Vencord update in isolation. Download, dependency installation, and build can take a few minutes...";
 
-                managedVencordUpdateStatus.style.color =
+                managedVencordOperationStatus.style.color =
                     "#aaa";
 
                 try {
@@ -6805,20 +6829,22 @@
                     }
 
                     if (result.updated !== true) {
-                        managedVencordUpdateStatus.textContent =
+                        managedVencordOperationStatus.textContent =
                             `✓ ${result.reason ?? "Managed Vencord is already current."}`;
 
-                        managedVencordUpdateStatus.style.color =
+                        managedVencordOperationStatus.style.color =
                             "#57f287";
                     } else {
-                        managedVencordUpdateStatus.textContent =
+                        managedVencordOperationStatus.textContent =
                             result.fromShortCommit === result.toShortCommit
                                 ? `✓ Managed Vencord refreshed at ${result.toShortCommit}. Native Vencord updater disabled; Maru Vencord Installer now owns updates. Rollback backup kept at ${result.backupPath}`
                                 : `✓ Managed Vencord updated: ${result.fromShortCommit} → ${result.toShortCommit}. Native Vencord updater disabled. Rollback backup kept at ${result.backupPath}`;
 
-                        managedVencordUpdateStatus.style.color =
+                        managedVencordOperationStatus.style.color =
                             "#57f287";
                     }
+
+                    if (result.diagnosticLogPath) managedVencordOperationStatus.textContent += `\nDiagnostic log: ${result.diagnosticLogPath}`;
 
                     await refreshVencordState();
                     await refreshUserPluginsState();
@@ -6829,23 +6855,24 @@
                     await refreshManagedVencordUpdateState();
 
                     if (result.updated === true) {
-                        managedVencordUpdateStatus.textContent =
+                        managedVencordOperationStatus.textContent =
                             result.fromShortCommit === result.toShortCommit
                                 ? `✓ Managed Vencord refreshed at ${result.toShortCommit}. Native Vencord updater disabled; Maru Vencord Installer now owns updates. Rollback backup kept at ${result.backupPath}`
                                 : `✓ Managed Vencord updated: ${result.fromShortCommit} → ${result.toShortCommit}. Native Vencord updater disabled. Rollback backup kept at ${result.backupPath}`;
 
-                        managedVencordUpdateStatus.style.color =
+                        managedVencordOperationStatus.style.color =
                             "#57f287";
                     }
+                    if (result.diagnosticLogPath) managedVencordOperationStatus.textContent += `\nDiagnostic log: ${result.diagnosticLogPath}`;
                 } catch (error) {
                     console.error(error);
 
-                    managedVencordUpdateStatus.textContent =
+                    managedVencordOperationStatus.textContent =
                         error?.message
                             ? `Vencord update failed: ${error.message}`
                             : "Managed Vencord update failed.";
 
-                    managedVencordUpdateStatus.style.color =
+                    managedVencordOperationStatus.style.color =
                         "#f23f42";
 
                     try {
@@ -6875,10 +6902,10 @@
                     selectedDiscord?.name;
 
                 if (!targetName) {
-                    repairManagedVencordStatus.textContent =
+                    managedVencordOperationStatus.textContent =
                         "Repair refused: no Discord installation is selected.";
 
-                    repairManagedVencordStatus.style.color =
+                    managedVencordOperationStatus.style.color =
                         "#f23f42";
 
                     return;
@@ -6894,21 +6921,10 @@
                     ownershipState?.state !== "managed" ||
                     ownershipState?.eligible !== true
                 ) {
-                    repairManagedVencordStatus.textContent =
+                    managedVencordOperationStatus.textContent =
                         `Repair refused: Discord ${targetName} is not managed by Maru Vencord Installer.`;
 
-                    repairManagedVencordStatus.style.color =
-                        "#f23f42";
-
-                    updateRepairManagedVencordButton();
-                    return;
-                }
-
-                if (currentManagedBuildState !== "built") {
-                    repairManagedVencordStatus.textContent =
-                        "Repair refused: managed Vencord build is not ready.";
-
-                    repairManagedVencordStatus.style.color =
+                    managedVencordOperationStatus.style.color =
                         "#f23f42";
 
                     updateRepairManagedVencordButton();
@@ -6917,27 +6933,28 @@
 
                 const confirmed =
                     window.confirm(
-                        `Repair managed Vencord for Discord ${targetName}?\n\nDiscord must be fully quit from the system tray before repairing.\n\nThis will repair only the selected Discord installation. The managed plugin workspace will be kept.`
+                        `Repair managed Vencord for Discord ${targetName}?\n\nDiscord must be fully quit from the system tray before repairing.\n\nRepair will assess source, build output, and plugins. If recovery is needed, it will rebuild the recorded installed Vencord commit in staging, preserve local customizations, and keep the previous source as a rollback backup. It will then repair only the selected Discord patch.`
                     );
 
                 if (!confirmed) {
-                    repairManagedVencordStatus.textContent =
+                    managedVencordOperationStatus.textContent =
                         "Repair cancelled.";
 
-                    repairManagedVencordStatus.style.color =
+                    managedVencordOperationStatus.style.color =
                         "#aaa";
 
                     return;
                 }
 
+                managedRepairInProgress = true;
                 repairManagedVencordButton.disabled = true;
                 repairManagedVencordButton.textContent =
                     `Repairing Discord ${targetName}...`;
 
-                repairManagedVencordStatus.textContent =
-                    `Using Vencord's official installer to repair the managed patch for Discord ${targetName}...`;
+                managedVencordOperationStatus.textContent =
+                    `Assessing managed source, plugins, build output, and the Discord patch for ${targetName}...`;
 
-                repairManagedVencordStatus.style.color =
+                managedVencordOperationStatus.style.color =
                     "#aaa";
 
                 try {
@@ -6953,11 +6970,17 @@
                         );
                     }
 
-                    repairManagedVencordStatus.textContent =
-                        `✓ Managed Vencord repaired for Discord ${result.name}. Managed workspace was kept.`;
+                    managedVencordOperationStatus.textContent =
+                        `✓ ${result.reason ?? "Managed Vencord repair verified."}${result.recovery?.backupPath ? `\nRollback backup: ${result.recovery.backupPath}` : ""}${result.diagnosticLogPath ? `\nDiagnostic log: ${result.diagnosticLogPath}` : ""}`;
 
-                    repairManagedVencordStatus.style.color =
+                    managedVencordOperationStatus.style.color =
                         "#57f287";
+
+                    await refreshVencordState();
+                    await refreshUserPluginsState();
+                    await refreshManagedInstalledPluginsState();
+                    await refreshManagedPluginDependenciesState();
+                    await refreshManagedBuildState();
 
                     const [
                         installs,
@@ -6977,14 +7000,15 @@
                 } catch (error) {
                     console.error(error);
 
-                    repairManagedVencordStatus.textContent =
+                    managedVencordOperationStatus.textContent =
                         error?.message
                             ? `Repair failed: ${error.message}`
                             : "Managed Vencord repair failed.";
 
-                    repairManagedVencordStatus.style.color =
+                    managedVencordOperationStatus.style.color =
                         "#f23f42";
                 } finally {
+                    managedRepairInProgress = false;
                     repairManagedVencordButton.textContent =
                         "Repair Managed Vencord";
 

@@ -1,11 +1,14 @@
 {
     "name": "maru-vencord-installer",
-    "version": "0.2.4",
+    "version": "0.2.7",
     "description": "One-click installer for Maru Vencord plugins.",
     "main": "main.js",
     "scripts": {
+        "prestart": "node scripts/prepare-source-overrides.mjs && node scripts/prepare-bundle.mjs",
         "start": "electron .",
+        "prepack:win": "node scripts/prepare-source-overrides.mjs && node scripts/prepare-bundle.mjs",
         "pack:win": "electron-builder --win --x64 --dir",
+        "predist:win": "node scripts/prepare-source-overrides.mjs && node scripts/prepare-bundle.mjs",
         "dist:win": "electron-builder --win --x64"
     },
     "author": "Maru",
@@ -28,27 +31,15 @@
             "index.html",
             "package.json",
             "resource-policy.mjs",
-            "bundle-policy.json"
+            "bundle-policy.json",
+            "source-customizations.mjs"
         ],
         "extraResources": [
             {
                 "from": "bundled-plugins",
                 "to": "bundled-plugins",
                 "filter": [
-                    "twitchPresence.desktop/index.tsx",
-                    "twitchPresence.desktop/native.ts",
-                    "twitchPresence.desktop/TwitchPanel.tsx",
-                    "kickPresence.desktop/index.tsx",
-                    "kickPresence.desktop/native.ts",
-                    "kickPresence.desktop/KickPanel.tsx",
-                    "ytmDesktopControls.desktop/index.tsx",
-                    "ytmDesktopControls.desktop/native.ts",
-                    "ytmDesktopControls.desktop/PlayerComponent.tsx",
-                    "statusSwitcher/index.tsx",
-                    "statusSwitcher/style.css",
-                    "maruWPEBackground/index.ts",
-                    "maruWPEBackground/native.ts",
-                    "maruFriendsSidebar/index.ts"
+                    "**/*"
                 ]
             },
             {
@@ -63,7 +54,8 @@
                 "to": "source-overrides",
                 "filter": [
                     "src/components/settings/tabs/themes/LocalThemesTab.tsx",
-                    "src/components/settings/tabs/vencord/index.tsx"
+                    "src/components/settings/tabs/vencord/index.tsx",
+                    "base/**/*"
                 ]
             },
             {
