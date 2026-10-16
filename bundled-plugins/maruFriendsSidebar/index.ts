@@ -342,6 +342,7 @@ function noCosmeticData(_options: any) { return null; }
 function FriendCosmetics({ user, displayName, row, nameHost, plateHost, content }: FriendCosmeticsProps) {
     const [hovered, setHovered] = React.useState(() => row.matches(":hover"));
     const [focused, setFocused] = React.useState(() => row.matches(":focus-visible"));
+    const [compact, setCompact] = React.useState(() => row.closest<HTMLElement>(".maruFriendsList")?.dataset.maruCompact === "true");
     // These hook identities are fixed for the lifetime of the row. Native hooks
     // subscribe to cosmetic/settings changes and keep their own motion policy.
     const useStyles = nativeCosmetics?.useStyles ?? noCosmeticData;
@@ -355,6 +356,7 @@ function FriendCosmetics({ user, displayName, row, nameHost, plateHost, content 
         const reconcile = () => {
             setHovered(row.matches(":hover"));
             focus();
+            setCompact(row.closest<HTMLElement>(".maruFriendsList")?.dataset.maruCompact === "true");
         };
         const pointer = () => setFocused(false);
         const list = row.closest(".maruFriendsList");
@@ -366,6 +368,7 @@ function FriendCosmetics({ user, displayName, row, nameHost, plateHost, content 
         row.addEventListener("mouseleave", leave);
         row.addEventListener("focus", focus);
         row.addEventListener("blur", blur);
+        reconcile();
         return () => {
             list?.removeEventListener("maruFriendsLayoutChange", reconcile);
             row.removeEventListener("keydown", focus);
@@ -386,7 +389,9 @@ function FriendCosmetics({ user, displayName, row, nameHost, plateHost, content 
         }) : displayName;
     const plate = nativeCosmetics?.Nameplate
         ? React.createElement(nativeCosmetics.Nameplate, {
-            nameplate: active ? equipped : null,
+            // Visibility differs by width; the native renderer owns idle media
+            // and animation/motion preferences through the separate hover prop.
+            nameplate: !compact || active ? equipped : null,
             hovered,
             content,
             placement: nativeCosmetics.placement
