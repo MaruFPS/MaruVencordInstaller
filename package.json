@@ -1,6 +1,6 @@
 {
     "name": "maru-vencord-installer",
-    "version": "0.2.8",
+    "version": "0.2.9",
     "description": "One-click installer for Maru Vencord plugins.",
     "main": "main.js",
     "scripts": {

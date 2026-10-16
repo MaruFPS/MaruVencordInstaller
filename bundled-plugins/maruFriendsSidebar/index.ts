@@ -943,9 +943,8 @@ function installStyles() {
             display: flex;
             align-items: center;
             justify-content: center;
-            width: 18px;
-            height: 18px;
-            margin-inline-start: auto;
+            width: 16px;
+            height: 16px;
             color: var(--icon-muted, var(--text-muted));
             flex: none;
         }
@@ -1947,6 +1946,14 @@ function populateFriendsSidebar(shell: HTMLElement) {
         }
         const header = section.querySelector<HTMLButtonElement>(".maruFriendsSectionHeader")!;
         const rows = section.querySelector<HTMLElement>(".maruFriendsSectionRows")!;
+        if (key !== "offline") {
+            const text = section.querySelector<HTMLElement>(".maruFriendsSectionLabel")!;
+            const countedLabel = `${label}\u00a0\u00a0·\u00a0\u00a0${grouped[key].length}`;
+            if (text.textContent !== countedLabel) {
+                text.textContent = countedLabel;
+                header.title = countedLabel;
+            }
+        }
         section.hidden = grouped[key].length === 0;
         const separated = !section.hidden && visibleSectionSeen;
         header.classList.toggle("maruFriendsSectionSeparated", separated);
