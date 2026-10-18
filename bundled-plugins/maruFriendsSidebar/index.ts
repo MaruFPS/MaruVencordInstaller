@@ -2,8 +2,8 @@ import { definePluginSettings, SettingsStore } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
 import { currentUserCategories } from "@plugins/pinDms/data";
 import definePlugin, { OptionType } from "@utils/types";
-import { extractAndLoadChunksLazy, filters, find, findModuleId, findStore, findStoreLazy, wreq } from "@webpack";
-import { ApplicationAssetUtils, Avatar, ChannelStore, ContextMenuApi, createRoot, Menu, React, ReactDOM, RelationshipStore, VoiceStateStore } from "@webpack/common";
+import { extractAndLoadChunksLazy, filters, find, findAll, findModuleId, findStore, findStoreLazy, wreq } from "@webpack";
+import { ApplicationAssetUtils, Avatar, ChannelStore, ContextMenuApi, createRoot, Menu, PermissionsBits, PermissionStore, React, ReactDOM, RelationshipStore, useStateFromStores, VoiceStateStore } from "@webpack/common";
 
 const UserStore: any = findStoreLazy("UserStore");
 const PresenceStore: any = findStoreLazy("PresenceStore");
@@ -69,6 +69,14 @@ let nativeActivityAsset: any = null;
 let nativeDuration: ((seconds: number) => string) | null = null;
 let presentationLoaded = false;
 const categoryScrollPositions = new Map<string, number>();
+let nativeHoverActions: any = null;
+let friendActionsComponent: any = null;
+type NativeRowClasses = Record<"container" | "active" | "row" | "content" | "actions" | "body" | "asset", string>;
+let nativeRowClasses: NativeRowClasses | null = null;
+let nativeActionStyleElement: HTMLStyleElement | null = null;
+let nativeAgeGatedSpacesEnabled: (() => boolean) | null = null;
+let nativeChannelAgeRestricted: ((channelId: string) => boolean) | null = null;
+const nativeSidebarScopes = new Set<HTMLElement>();
 type SectionKey = "active_now" | "online" | "offline";
 type ActivityIcon = "game" | "music" | "watching" | "voice" | "custom" | null;
 const sections: { key: SectionKey; label: string; }[] = [
@@ -92,6 +100,7 @@ interface FriendRowData {
     gameAssetUrl: string | null;
     gameAppId: string | null;
     voiceIcon: any;
+    voiceChannelId: string | null;
 }
 
 function loadNativePresentation() {
@@ -402,14 +411,14 @@ function FriendCosmetics({ user, displayName, row, nameHost, plateHost, content 
     );
 }
 
-function captureNativeActivityAsset() {
+function captureNativeActivityAsset(shell = lastShell) {
     if (nativeActivityAsset) return;
     const filter = filters.componentByCode("gameAppId:", "gameAssetUrl:", "size:32");
     nativeActivityAsset = findNativeExport("gameAppId:", "gameAssetUrl:", "size:32");
     if (nativeActivityAsset) return;
     // The current experiment keeps this component private. Locate it by its
     // native props/render signature, retaining Discord's application-loading hook.
-    for (const image of lastShell?.querySelectorAll('img[alt="App icon"]') ?? []) {
+    for (const image of shell?.querySelectorAll('[data-list-item-id^="friends-list___"] img') ?? []) {
         const key = Object.keys(image).find(name => name.startsWith("__reactFiber$"));
         for (let fiber = key ? (image as any)[key] : null; fiber; fiber = fiber.return) {
             if (!filter(fiber.type)) continue;
@@ -417,6 +426,148 @@ function captureNativeActivityAsset() {
             return;
         }
     }
+}
+
+function getElementFiber(element: Element) {
+    const key = Object.keys(element).find(name => name.startsWith("__reactFiber$"));
+    return key ? (element as any)[key] : null;
+}
+
+function loadNativeVoiceEligibility() {
+    if (!nativeAgeGatedSpacesEnabled) {
+        // This export is the non-hook predicate called by the native row's
+        // eligibility callback; the similarly named React hook is not suitable.
+        const candidates = findAll(filters.byCode("AGE_GATED_SPACES"));
+        nativeAgeGatedSpacesEnabled = candidates.find(value => typeof value === "function" && value.length === 0 &&
+            String(value).includes(".AGE_GATED_SPACES)&&")) as (() => boolean) | undefined ?? null;
+    }
+    if (!nativeChannelAgeRestricted) {
+        nativeChannelAgeRestricted = find(value => typeof value === "function" &&
+            /return!![\w$]+\(\)&&null!=[\w$]+&&[\w$]+\([\w$.]+\.getChannel\([\w$]+\)\)/.test(String(value)),
+        { isIndirect: true }) ?? null;
+    }
+}
+
+// Discord's private action component owns the buttons, localized tooltips,
+// icons, propagation guards, DM navigation, stage handling and voice selection.
+// Keep a stable hook owner around its direct invocation, removing only the child
+// whose onClick is the exact onMoreClick callback supplied to that component.
+function omittedNativeMore() { }
+
+function NativeFriendActions({ userId, voiceChannelId }: { userId: string; voiceChannelId: string | null; }) {
+    const voiceChannel = useStateFromStores([ChannelStore, PermissionStore, VoiceStateStore], () => {
+        // Custom categories do not have the native voice-channel subgroup. Use
+        // only FriendRowStore's channel ID, then mirror the inspected native gate.
+        if (voiceChannelId == null || !nativeAgeGatedSpacesEnabled || !nativeChannelAgeRestricted) return null;
+        const channel = ChannelStore.getChannel(voiceChannelId);
+        return channel == null || (VoiceStateStore as any).isInChannel(channel.id) ||
+            nativeAgeGatedSpacesEnabled() && nativeChannelAgeRestricted(channel.id) ||
+            !channel.isPrivate() && !PermissionStore.can(PermissionsBits.CONNECT, channel) ? null : channel;
+    }, [voiceChannelId]);
+    const native = nativeHoverActions({ userId, voiceChannel, tabIndex: 0, onMoreClick: omittedNativeMore });
+    const children = React.Children.toArray(native.props.children);
+    const kept = children.filter((child: any) => child?.props?.children?.props?.onClick !== omittedNativeMore);
+    // An upstream structure change must not silently reintroduce the menu.
+    if (kept.length === children.length) return null;
+    return React.cloneElement(native, {
+        className: `${native.props.className} maruFriendActions`
+    }, kept);
+}
+
+function installNativeActionStyles() {
+    if (!nativeRowClasses) return;
+    nativeActionStyleElement ??= document.createElement("style");
+    nativeActionStyleElement.id = "maru-friends-native-actions-style";
+    const container = CSS.escape(nativeRowClasses.container);
+    const active = CSS.escape(nativeRowClasses.active);
+    const actions = CSS.escape(nativeRowClasses.actions);
+    const css = `
+        .maruNativeFriendsSidebar [data-maru-native-more] { display: none !important; }
+        /* Native CSS expands actions before React removes the artwork. Hide the
+           inspected asset in that same style calculation, preventing one reflow
+           with artwork and expanded buttons both occupying the row. */
+        .maruNativeFriendsSidebar .${container}:is(:hover, .${active}):has(.${actions}) [data-maru-native-activity] {
+            display: none !important;
+        }
+    `;
+    if (nativeActionStyleElement.textContent !== css) nativeActionStyleElement.textContent = css;
+    if (!nativeActionStyleElement.isConnected) document.head.appendChild(nativeActionStyleElement);
+}
+
+function captureNativeSidebarActions(shell: HTMLElement) {
+    shell.classList.add("maruNativeFriendsSidebar");
+    nativeSidebarScopes.add(shell);
+    captureNativeActivityAsset(shell);
+    if (!nativeRowClasses) {
+        const names = ["container", "active", "row", "content", "actions", "body", "asset"] as const;
+        const classes = find(value => value != null && typeof value === "object" && names.every(name =>
+            Object.values(value).some(v => typeof v === "string" && v.startsWith(`${name}_`))), { isIndirect: true });
+        if (classes) nativeRowClasses = Object.fromEntries(names.map(name => [name,
+            (Object.values(classes).find((v): v is string => typeof v === "string" && v.startsWith(`${name}_`))!).split(" ")[0]
+        ])) as NativeRowClasses;
+    }
+    const actionFilter = filters.componentByCode("onMoreClick:", "voiceChannel:", "recipientIds:");
+    const assetFilter = filters.componentByCode("gameAppId:", "gameAssetUrl:", "size:32");
+    for (const row of shell.querySelectorAll<HTMLElement>('[data-list-item-id^="friends-list___"]')) {
+        for (const button of row.querySelectorAll<HTMLElement>("button")) {
+            const buttonFiber = getElementFiber(button);
+            const buttonBranch: any[] = [];
+            for (let fiber = buttonFiber; fiber; fiber = fiber.return) {
+                if (!actionFilter(fiber.type)) {
+                    buttonBranch.push(fiber);
+                    continue;
+                }
+                nativeHoverActions ??= fiber.type;
+                // Discord's tooltip merges the trigger's onClick with its own
+                // handler. Its original child still carries the exact native
+                // onMoreClick callback, unlike the rendered DOM button.
+                const onMoreClick = fiber.memoizedProps?.onMoreClick;
+                const isMoreButton = typeof onMoreClick === "function" && buttonBranch.some(node =>
+                    node.memoizedProps?.onClick === onMoreClick ||
+                    node.memoizedProps?.children?.props?.onClick === onMoreClick);
+                if (isMoreButton)
+                    button.dataset.maruNativeMore = "true";
+                else
+                    delete button.dataset.maruNativeMore;
+                break;
+            }
+        }
+        if (!nativeRowClasses) continue;
+        const content = row.querySelector(`.${CSS.escape(nativeRowClasses.content)}`);
+        // Mark only the native asset component's direct content child. Cosmetic
+        // nameplates, avatars, status icons and unrelated images are excluded.
+        for (const child of content?.children ?? []) {
+            for (let fiber = getElementFiber(child); fiber; fiber = fiber.return) {
+                if (!assetFilter(fiber.type)) continue;
+                (child as HTMLElement).dataset.maruNativeActivity = "true";
+                break;
+            }
+        }
+    }
+    if (nativeHoverActions && !friendActionsComponent) {
+        loadNativeVoiceEligibility();
+        friendActionsComponent = React.memo(ErrorBoundary.wrap(NativeFriendActions, { noop: true }));
+        if (selectedCategoryId) scheduleSidebarRefresh();
+    }
+    installNativeActionStyles();
+}
+
+function restoreNativeSidebarActions() {
+    for (const shell of nativeSidebarScopes) {
+        shell.classList.remove("maruNativeFriendsSidebar");
+        shell.querySelectorAll<HTMLElement>("[data-maru-native-more], [data-maru-native-activity]").forEach(element => {
+            delete element.dataset.maruNativeMore;
+            delete element.dataset.maruNativeActivity;
+        });
+    }
+    nativeSidebarScopes.clear();
+    nativeActionStyleElement?.remove();
+    nativeActionStyleElement = null;
+    friendActionsComponent = null;
+    nativeHoverActions = null;
+    nativeRowClasses = null;
+    nativeAgeGatedSpacesEnabled = null;
+    nativeChannelAgeRestricted = null;
 }
 
 function normalizeActivityStart(start: unknown): number | null {
@@ -886,6 +1037,19 @@ function installStyles() {
             background: var(--background-mod-subtle, rgba(255, 255, 255, 0.06));
         }
 
+        .maruFriendActionsHost { display: contents; }
+        .maruFriendActions { visibility: hidden; }
+        .maruFriendRow:is(:hover, :focus-within) .maruFriendActions {
+            margin-inline-start: var(--space-4);
+            opacity: 1;
+            overflow: visible;
+            visibility: visible;
+            width: auto;
+        }
+        .maruFriendRow:is(:hover, :focus-within):has(.maruFriendActions) .maruFriendGameAsset {
+            display: none !important;
+        }
+
         .maruFriendsList {
             scrollbar-gutter: stable both-edges;
             font-family: var(--font-primary);
@@ -960,6 +1124,7 @@ function installStyles() {
         .maruFriendsList[data-maru-compact="true"] .maruFriendsSectionLabel,
         .maruFriendsList[data-maru-compact="true"] .maruFriendsSectionChevron,
         .maruFriendsList[data-maru-compact="true"] .maruFriendBody,
+        .maruFriendsList[data-maru-compact="true"] .maruFriendActions,
         .maruFriendsList[data-maru-compact="true"] .maruFriendGameAsset {
             display: none !important;
         }
@@ -1538,6 +1703,7 @@ function getFriendRowData(id: string): FriendRowData | null {
         activityBaseText,
         gameAssetUrl,
         gameAppId,
+        voiceChannelId: nativeRow?.voiceChannelId ?? null,
         voiceIcon: icon === "voice" ? nativeChannelIcon?.(ChannelStore.getChannel(voiceChannelId)) ?? null : null
     };
 }
@@ -1557,7 +1723,7 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
         padding: 8px;
         display: flex;
         align-items: center;
-        gap: 8px;
+        gap: 0;
         box-sizing: border-box;
         border-radius: 8px;
         flex: none;
@@ -1616,10 +1782,14 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
     const gameAssetHost = document.createElement("span");
     gameAssetHost.className = "maruFriendGameAsset";
     gameAssetHost.style.cssText = "width: 32px; height: 32px; flex: none; display: flex; align-items: center;";
+    const actionsHost = document.createElement("span");
+    actionsHost.className = "maruFriendActionsHost";
     let assetRenderer = nativeActivityAsset;
+    let actionsRenderer = friendActionsComponent;
 
     function renderVisuals(data: FriendRowData) {
         assetRenderer = nativeActivityAsset;
+        actionsRenderer = friendActionsComponent;
         // Native theme context selects the equipped Nameplate palette.
         // Reuse the same provider bridge as profiles, keeping this root stable.
         avatarRoot.render(inheritNativeSidebarContexts(React.createElement(React.Fragment, null,
@@ -1637,7 +1807,9 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
             assetRenderer && (data.gameAppId || data.gameAssetUrl) && ReactDOM.createPortal(
                 React.createElement(ErrorBoundary, { noop: true },
                     React.createElement(assetRenderer, { gameAppId: data.gameAppId, gameAssetUrl: data.gameAssetUrl })),
-                gameAssetHost)
+                gameAssetHost),
+            actionsRenderer && ReactDOM.createPortal(
+                React.createElement(actionsRenderer, { userId: id, voiceChannelId: data.voiceChannelId }), actionsHost)
         )).node);
     }
     renderVisuals(data);
@@ -1716,7 +1888,7 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
 
     friendRowUpdates.set(row, next => {
         // Reconcile props on the existing React root; never remount for presence updates.
-        if (next.avatarSrc !== current.avatarSrc || next.status !== current.status || next.user !== current.user || next.displayName !== current.displayName || next.gameAppId !== current.gameAppId || next.gameAssetUrl !== current.gameAssetUrl || assetRenderer !== nativeActivityAsset)
+        if (next.avatarSrc !== current.avatarSrc || next.status !== current.status || next.user !== current.user || next.displayName !== current.displayName || next.gameAppId !== current.gameAppId || next.gameAssetUrl !== current.gameAssetUrl || next.voiceChannelId !== current.voiceChannelId || assetRenderer !== nativeActivityAsset || actionsRenderer !== friendActionsComponent)
             renderVisuals(next);
         if (!friendCosmeticsComponent && next.displayName !== current.displayName)
             name.textContent = next.displayName;
@@ -1744,7 +1916,7 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
     });
 
     content.append(avatarWrap, text);
-    row.append(plateHost, content);
+    row.append(plateHost, content, actionsHost);
     updateGameAsset(data);
 
     row.addEventListener("pointerenter", () => {
@@ -1769,10 +1941,12 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
 
     row.style.cursor = "pointer";
     row.addEventListener("click", event => {
+        if (event.target instanceof Element && event.target.closest(".maruFriendActionsHost")) return;
         hideMaruFriendTooltip(true);
         openNativeUserProfileCard(event, current.user);
     });
     row.addEventListener("keydown", event => {
+        if (event.target instanceof Element && event.target.closest(".maruFriendActionsHost")) return;
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
         row.click();
@@ -2031,6 +2205,10 @@ function checkForSidebar() {
 
         return;
     }
+
+    // Capture and clean native actions in normal mode too, before a category
+    // hides native virtualized rows and their private React component identities.
+    captureNativeSidebarActions(shell);
 
     if (shell === lastShell) {
         setupSortControl(shell);
@@ -2376,6 +2554,7 @@ export default definePlugin({
         restoreModeButton();
         restoreNativeSidebar();
         unmountAvatars();
+        restoreNativeSidebarActions();
         friendAvatarComponent = null;
         nativeAvatarHook = null;
         friendCosmeticsComponent = null;
