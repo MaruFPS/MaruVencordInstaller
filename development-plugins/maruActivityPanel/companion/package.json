@@ -1,0 +1,46 @@
+{
+  "name": "maru-activity-companion",
+  "displayName": "Maru Activity Companion",
+  "description": "Private, local VS Code activity for the MaruActivityPanel Vencord plugin.",
+  "version": "0.1.0",
+  "publisher": "maru-local",
+  "license": "GPL-3.0-or-later",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "extensionKind": ["ui"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": { "supported": true },
+    "virtualWorkspaces": { "supported": true }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "test": "npm run compile && node --test ../tests/companion.test.cjs",
+    "package": "npm run compile && node scripts/package.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.9.3"
+  },
+  "contributes": {
+    "commands": [
+      { "command": "maruActivity.pair", "title": "Maru Activity: Pair with Discord" },
+      { "command": "maruActivity.rotateToken", "title": "Maru Activity: Replace Pairing Token" }
+    ],
+    "configuration": {
+      "title": "Maru Activity Companion",
+      "properties": {
+        "maruActivity.enabled": { "type": "boolean", "default": true, "scope": "application", "description": "Send only selected editor metadata to the paired Discord plugin on this computer." },
+        "maruActivity.port": { "type": "integer", "default": 32145, "minimum": 1024, "maximum": 65535, "scope": "application", "description": "Loopback bridge port. Must match MaruActivityPanel in Discord." },
+        "maruActivity.idleSeconds": { "type": "integer", "default": 120, "minimum": 15, "maximum": 3600, "scope": "application", "description": "Mark the editor idle after this many seconds without editor interaction. Unfocused windows are immediately idle." },
+        "maruActivity.shareWorkspace": { "type": "boolean", "default": true, "scope": "application", "description": "Send the workspace label (never an absolute path)." },
+        "maruActivity.shareFile": { "type": "boolean", "default": true, "scope": "application", "description": "Send the active file basename and language, never its content or full path." },
+        "maruActivity.shareCursor": { "type": "boolean", "default": true, "scope": "application", "description": "Send the active cursor line and column. No selected text is read." },
+        "maruActivity.shareDuration": { "type": "boolean", "default": true, "scope": "application", "description": "Send the workspace session start time." },
+        "maruActivity.shareRepository": { "type": "boolean", "default": true, "scope": "application", "description": "Send a sanitized HTTPS repository URL from the built-in Git extension, when available." }
+      }
+    }
+  }
+}
