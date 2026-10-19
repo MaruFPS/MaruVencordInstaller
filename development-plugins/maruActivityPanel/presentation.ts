@@ -4,6 +4,38 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import type { Activity } from "./shared";
+import type { MirroredPresence } from "./vscord";
+
+interface DisplaySettings {
+    showFile: boolean;
+    showWorkspace: boolean;
+    showCursor: boolean;
+    showDuration: boolean;
+    showRepository: boolean;
+}
+
+export function activityDisplay(activity: Activity, presence: MirroredPresence | null, config: DisplaySettings) {
+    // VSCord's free-form text may embed any field, so individual visibility
+    // controls must never be bypassed by a customized details/state template.
+    const customText = !!presence && !!activity.vscord?.allowText
+        && config.showFile && config.showWorkspace && config.showCursor
+        && config.showDuration && config.showRepository;
+    const buttons = presence && activity.vscord?.allowButtons && customText
+        ? presence.buttons ?? []
+        : activity.repository ? [{ label: "View Repository", url: activity.repository }] : [];
+    return {
+        application: customText && presence?.name ? presence.name : "VS Code",
+        file: config.showFile ? customText ? presence?.state : activity.file : undefined,
+        workspace: config.showWorkspace ? customText ? presence?.details : activity.workspace : undefined,
+        startedAt: !config.showDuration ? undefined
+            : presence && activity.vscord?.allowTimestamp ? presence.startedAt : activity.startedAt,
+        image: customText && activity.vscord?.allowImages && presence?.image
+            ? { asset: presence.image.asset, title: customText ? presence.image.title : undefined } : undefined,
+        buttons: config.showRepository ? buttons : []
+    };
+}
+
 export function elapsedLabel(start: number, now = Date.now()) {
     const minutes = Math.max(0, Math.floor((now - start) / 60000));
     return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;

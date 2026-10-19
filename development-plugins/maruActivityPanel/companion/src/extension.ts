@@ -6,6 +6,7 @@ import * as vscode from "vscode";
 import { ActivityModel, basenameLabel, EditorSnapshot, Privacy, validIdleSeconds, validPort } from "./activity";
 import { RepositorySource } from "./git";
 import { HEARTBEAT_MS, LoopbackTransport } from "./transport";
+import { readVSCordIdentity } from "./vscord";
 
 const SECRET_KEY = "maruActivity.bridgeToken";
 const DEBOUNCE_MS = 200;
@@ -63,9 +64,11 @@ class Companion implements vscode.Disposable {
             vscode.workspace.onDidChangeWorkspaceFolders(interact),
             vscode.workspace.onDidChangeConfiguration(event => {
                 if (event.affectsConfiguration("maruActivity")) this.configure();
+                else if (event.affectsConfiguration("vscord")) this.schedule(false);
             }),
             vscode.extensions.onDidChange(() => {
                 if (this.settings.shareRepository) void this.repository.initialize();
+                this.schedule(false);
             }),
             context.secrets.onDidChange(event => {
                 if (event.key === SECRET_KEY) void this.loadToken();
@@ -185,7 +188,9 @@ class Companion implements vscode.Disposable {
     private publish(): void {
         if (this.disposed || !this.transport) return;
         const now = Date.now();
-        this.transport.publish(this.model.snapshot(this.snapshot(), this.settings, this.settings.idleSeconds, now));
+        const activity = this.model.snapshot(this.snapshot(), this.settings, this.settings.idleSeconds, now);
+        if (activity.status !== "unavailable") activity.vscord = readVSCordIdentity(this.settings);
+        this.transport.publish(activity);
         if (this.idle) clearTimeout(this.idle);
         this.idle = undefined;
         const remaining = this.model.idleDeadline(this.settings.idleSeconds) - now;

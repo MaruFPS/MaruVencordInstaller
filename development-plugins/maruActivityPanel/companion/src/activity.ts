@@ -1,5 +1,15 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
+/** Match this window's local VSCord RPC activity without sending formatted presence text. */
+export interface VSCordIdentity {
+    applicationId: string;
+    pid: number;
+    allowText: boolean;
+    allowImages: boolean;
+    allowTimestamp: boolean;
+    allowButtons: boolean;
+}
+
 export interface Activity {
     sessionId: string;
     sequence: number;
@@ -14,6 +24,7 @@ export interface Activity {
     line?: number;
     column?: number;
     repository?: string;
+    vscord?: VSCordIdentity;
 }
 
 export interface Privacy {

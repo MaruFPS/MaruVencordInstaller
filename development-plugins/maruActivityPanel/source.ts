@@ -5,20 +5,66 @@
  */
 
 import { PluginNative } from "@utils/types";
+import { findStore } from "@webpack";
 
 import { onSourceSettingsChanged, settings } from "./settings";
-import { Snapshot } from "./shared";
+import { Activity, Snapshot } from "./shared";
+import { MirroredPresence, selectVSCordPresence } from "./vscord";
+
+interface LocalActivityStore {
+    getApplicationActivities(): unknown;
+    addChangeListener(listener: () => void): void;
+    removeChangeListener(listener: () => void): void;
+}
+
+export type PanelSnapshot = Snapshot & { presence: MirroredPresence | null; };
 
 const Native = VencordNative.pluginHelpers.MaruActivityPanel as PluginNative<typeof import("./native")>;
 const listeners = new Set<() => void>();
-let snapshot: Snapshot = { revision: 0, activity: null };
+let snapshot: PanelSnapshot = { revision: 0, activity: null, presence: null };
+let localStore: LocalActivityStore | undefined;
 let active = false;
 let generation = 0;
 let retry: ReturnType<typeof setTimeout> | undefined;
 let operations = Promise.resolve();
 
 function publish(next: Snapshot) {
-    snapshot = next;
+    snapshot = { ...next, presence: readPresence(next.activity) };
+    for (const listener of listeners) listener();
+}
+
+function detachLocalStore() {
+    try { localStore?.removeChangeListener(localActivityChanged); } catch { /* The editor bridge remains independent. */ }
+    localStore = undefined;
+}
+
+function readPresence(activity: Activity | null): MirroredPresence | null {
+    if (!active || !activity?.vscord || activity.status === "unavailable") {
+        detachLocalStore();
+        return null;
+    }
+    try {
+        if (!localStore) {
+            // Read the raw local RPC socket map, before public presence/Invisible filtering.
+            // Retry a missing store only on an existing companion update, never by polling.
+            const candidate = findStore("LocalActivityStore") as LocalActivityStore | null;
+            if (!candidate || typeof candidate.getApplicationActivities !== "function"
+                || typeof candidate.addChangeListener !== "function"
+                || typeof candidate.removeChangeListener !== "function") return null;
+            localStore = candidate;
+            localStore.addChangeListener(localActivityChanged);
+        }
+        return selectVSCordPresence(localStore.getApplicationActivities(), activity);
+    } catch {
+        detachLocalStore();
+        return null;
+    }
+}
+
+function localActivityChanged() {
+    const presence = readPresence(snapshot.activity);
+    if (JSON.stringify(presence) === JSON.stringify(snapshot.presence)) return;
+    snapshot = { ...snapshot, presence };
     for (const listener of listeners) listener();
 }
 

@@ -41,6 +41,7 @@ const vscode = __importStar(require("vscode"));
 const activity_1 = require("./activity");
 const git_1 = require("./git");
 const transport_1 = require("./transport");
+const vscord_1 = require("./vscord");
 const SECRET_KEY = "maruActivity.bridgeToken";
 const DEBOUNCE_MS = 200;
 function configuration() {
@@ -88,9 +89,12 @@ class Companion {
         }), vscode.workspace.onDidChangeWorkspaceFolders(interact), vscode.workspace.onDidChangeConfiguration(event => {
             if (event.affectsConfiguration("maruActivity"))
                 this.configure();
+            else if (event.affectsConfiguration("vscord"))
+                this.schedule(false);
         }), vscode.extensions.onDidChange(() => {
             if (this.settings.shareRepository)
                 void this.repository.initialize();
+            this.schedule(false);
         }), context.secrets.onDidChange(event => {
             if (event.key === SECRET_KEY)
                 void this.loadToken();
@@ -217,7 +221,10 @@ class Companion {
         if (this.disposed || !this.transport)
             return;
         const now = Date.now();
-        this.transport.publish(this.model.snapshot(this.snapshot(), this.settings, this.settings.idleSeconds, now));
+        const activity = this.model.snapshot(this.snapshot(), this.settings, this.settings.idleSeconds, now);
+        if (activity.status !== "unavailable")
+            activity.vscord = (0, vscord_1.readVSCordIdentity)(this.settings);
+        this.transport.publish(activity);
         if (this.idle)
             clearTimeout(this.idle);
         this.idle = undefined;

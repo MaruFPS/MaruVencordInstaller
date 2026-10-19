@@ -40,19 +40,29 @@ class LoopbackTransport {
             await this.send(activity);
         }
     }
-    send(activity) {
+    async send(activity) {
+        const status = await this.sendOnce(activity);
+        // Older plugin validators reject the new optional identity. Preserve raw tracking
+        // without remembering a legacy mode, so a plugin update enables mirroring itself.
+        if (status === 400 && activity.vscord && !this.closed) {
+            const legacy = { ...activity };
+            delete legacy.vscord;
+            await this.sendOnce(legacy);
+        }
+    }
+    sendOnce(activity) {
         const body = JSON.stringify(activity);
         if (Buffer.byteLength(body) > 8192)
-            return Promise.resolve();
+            return Promise.resolve(undefined);
         return new Promise(resolve => {
             let finished = false;
-            const done = () => {
+            const done = (status) => {
                 if (finished)
                     return;
                 finished = true;
                 if (this.current === req)
                     this.current = undefined;
-                resolve();
+                resolve(status);
             };
             const req = (0, node_http_1.request)({
                 hostname: "127.0.0.1",
@@ -68,14 +78,14 @@ class LoopbackTransport {
                 }
             }, response => {
                 response.resume();
-                response.on("error", done);
-                response.on("end", done);
+                response.on("error", () => done());
+                response.on("end", () => done(response.statusCode));
             });
             this.current = req;
             // A deadline covers DNS/connect/response time; socket inactivity alone is insufficient.
             const deadline = setTimeout(() => req.destroy(), exports.REQUEST_TIMEOUT_MS);
             deadline.unref();
-            req.on("error", done);
+            req.on("error", () => done());
             req.on("close", () => { clearTimeout(deadline); done(); });
             req.end(body);
         });

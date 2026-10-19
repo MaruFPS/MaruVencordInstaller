@@ -37,16 +37,27 @@ export class LoopbackTransport {
         }
     }
 
-    private send(activity: Activity): Promise<void> {
+    private async send(activity: Activity): Promise<void> {
+        const status = await this.sendOnce(activity);
+        // Older plugin validators reject the new optional identity. Preserve raw tracking
+        // without remembering a legacy mode, so a plugin update enables mirroring itself.
+        if (status === 400 && activity.vscord && !this.closed) {
+            const legacy = { ...activity };
+            delete legacy.vscord;
+            await this.sendOnce(legacy);
+        }
+    }
+
+    private sendOnce(activity: Activity): Promise<number | undefined> {
         const body = JSON.stringify(activity);
-        if (Buffer.byteLength(body) > 8192) return Promise.resolve();
+        if (Buffer.byteLength(body) > 8192) return Promise.resolve(undefined);
         return new Promise(resolve => {
             let finished = false;
-            const done = () => {
+            const done = (status?: number) => {
                 if (finished) return;
                 finished = true;
                 if (this.current === req) this.current = undefined;
-                resolve();
+                resolve(status);
             };
             const req = request({
                 hostname: "127.0.0.1",
@@ -62,14 +73,14 @@ export class LoopbackTransport {
                 }
             }, response => {
                 response.resume();
-                response.on("error", done);
-                response.on("end", done);
+                response.on("error", () => done());
+                response.on("end", () => done(response.statusCode));
             });
             this.current = req;
             // A deadline covers DNS/connect/response time; socket inactivity alone is insufficient.
             const deadline = setTimeout(() => req.destroy(), REQUEST_TIMEOUT_MS);
             deadline.unref();
-            req.on("error", done);
+            req.on("error", () => done());
             req.on("close", () => { clearTimeout(deadline); done(); });
             req.end(body);
         });
