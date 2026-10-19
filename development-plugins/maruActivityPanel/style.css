@@ -1,0 +1,129 @@
+.maru-activity-panel {
+    box-sizing: border-box;
+    min-width: 0;
+    max-width: 100%;
+    margin: 4px 6px;
+    padding: 7px 9px 9px;
+    border-radius: var(--radius-sm, 9px);
+    background: var(--background-base-low, var(--background-secondary-alt, #1e1f22));
+    color: var(--text-normal);
+    font-family: var(--font-primary);
+    font-size: 12px;
+    line-height: 1.4;
+    overflow: hidden;
+}
+
+/* Match the local theme's panel specificity; affect only our own direct child. */
+#app-mount .maru-activity-panel[data-position="above"] {
+    order: 25 !important;
+}
+
+#app-mount .maru-activity-panel[data-position="below"] {
+    order: 32 !important;
+}
+
+.maru-activity-panel-header {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    margin: 0 0 4px;
+    color: var(--text-strong, var(--header-primary, #fff));
+}
+
+
+.maru-activity-panel-heading {
+    min-width: 0;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .04em;
+}
+
+.maru-activity-panel-status {
+    margin-left: 6px;
+    font-weight: 400;
+    letter-spacing: normal;
+}
+
+.maru-activity-panel-content {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.maru-activity-panel-language {
+    width: 40px;
+    height: 40px;
+    flex: 0 0 40px;
+}
+
+.maru-activity-panel-details {
+    min-width: 0;
+    flex: 1;
+}
+
+.maru-activity-panel-file,
+.maru-activity-panel-workspace {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.maru-activity-panel-file {
+    color: var(--text-strong, var(--header-primary, #fff));
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.maru-activity-panel-workspace {
+    color: var(--text-strong, var(--header-primary, #fff));
+    font-size: 11px;
+}
+
+.maru-activity-panel-duration {
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.maru-activity-panel-duration {
+    font-variant-numeric: tabular-nums;
+}
+
+.maru-activity-panel-secondary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px 8px;
+    margin-top: 6px;
+    color: var(--text-muted);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+}
+
+.maru-activity-panel-repository {
+    color: var(--text-link);
+    text-decoration: none;
+    transition: opacity 120ms ease;
+}
+
+.maru-activity-panel-repository:focus-visible {
+    outline: 2px solid var(--focus-primary, var(--brand-500));
+    outline-offset: 2px;
+}
+
+.maru-activity-panel-repository:hover {
+    opacity: .8;
+    text-decoration: underline;
+}
+
+.maru-activity-panel-empty {
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+    font-size: 11px;
+}
+
+
+@media (prefers-reduced-motion: reduce) {.maru-activity-panel-repository {
+    transition: none;
+}
+
+ }
