@@ -66,6 +66,7 @@ let nativeFriendRows: any = null;
 let nativeLocale: any = null;
 let nativeActivityText: ((activity: any) => { text?: string; }) | null = null;
 let nativeActivityAsset: any = null;
+let nativeRowArtwork: any = null;
 let nativeDuration: ((seconds: number) => string) | null = null;
 let presentationLoaded = false;
 const categoryScrollPositions = new Map<string, number>();
@@ -99,6 +100,7 @@ interface FriendRowData {
     activityBaseText: string | null;
     gameAssetUrl: string | null;
     gameAppId: string | null;
+    isListening: boolean;
     voiceIcon: any;
     voiceChannelId: string | null;
 }
@@ -412,20 +414,28 @@ function FriendCosmetics({ user, displayName, row, nameHost, plateHost, content 
 }
 
 function captureNativeActivityAsset(shell = lastShell) {
-    if (nativeActivityAsset) return;
-    const filter = filters.componentByCode("gameAppId:", "gameAssetUrl:", "size:32");
-    nativeActivityAsset = findNativeExport("gameAppId:", "gameAssetUrl:", "size:32");
-    if (nativeActivityAsset) return;
-    // The current experiment keeps this component private. Locate it by its
-    // native props/render signature, retaining Discord's application-loading hook.
-    for (const image of shell?.querySelectorAll('[data-list-item-id^="friends-list___"] img') ?? []) {
-        const key = Object.keys(image).find(name => name.startsWith("__reactFiber$"));
-        for (let fiber = key ? (image as any)[key] : null; fiber; fiber = fiber.return) {
-            if (!filter(fiber.type)) continue;
-            nativeActivityAsset = fiber.type;
-            return;
+    if (nativeActivityAsset && nativeRowArtwork) return;
+    const previousAsset = nativeActivityAsset;
+    const previousArtwork = nativeRowArtwork;
+    const gameFilter = filters.componentByCode("gameAppId:", "gameAssetUrl:", "size:32");
+    const artworkFilter = filters.componentByCode("sectionType:", ".gameAppId", ".isListening");
+    nativeActivityAsset ??= findNativeExport("gameAppId:", "gameAssetUrl:", "size:32");
+    nativeRowArtwork ??= findNativeExport("sectionType:", ".gameAppId", ".isListening");
+    // The shared chooser and game renderer are private in the current build.
+    // Capture either real images or ContentImage's native fallback SVG, retaining
+    // music's presence subscription, native asset hook and error placeholder.
+    if (!nativeActivityAsset || !nativeRowArtwork) {
+        for (const row of shell?.querySelectorAll<HTMLElement>('[data-list-item-id^="friends-list___"]') ?? []) {
+            for (const image of row.querySelectorAll("img, svg")) {
+                for (let fiber = getElementFiber(image); fiber && fiber.stateNode !== row; fiber = fiber.return) {
+                    if (!nativeActivityAsset && gameFilter(fiber.type)) nativeActivityAsset = fiber.type;
+                    if (!nativeRowArtwork && artworkFilter(fiber.type)) nativeRowArtwork = fiber.type;
+                }
+            }
         }
     }
+    if (selectedCategoryId && (previousAsset !== nativeActivityAsset || previousArtwork !== nativeRowArtwork))
+        scheduleSidebarRefresh();
 }
 
 function getElementFiber(element: Element) {
@@ -508,6 +518,7 @@ function captureNativeSidebarActions(shell: HTMLElement) {
     }
     const actionFilter = filters.componentByCode("onMoreClick:", "voiceChannel:", "recipientIds:");
     const assetFilter = filters.componentByCode("gameAppId:", "gameAssetUrl:", "size:32");
+    const artworkFilter = filters.componentByCode("sectionType:", ".gameAppId", ".isListening");
     for (const row of shell.querySelectorAll<HTMLElement>('[data-list-item-id^="friends-list___"]')) {
         for (const button of row.querySelectorAll<HTMLElement>("button")) {
             const buttonFiber = getElementFiber(button);
@@ -534,14 +545,18 @@ function captureNativeSidebarActions(shell: HTMLElement) {
         }
         if (!nativeRowClasses) continue;
         const content = row.querySelector(`.${CSS.escape(nativeRowClasses.content)}`);
-        // Mark only the native asset component's direct content child. Cosmetic
-        // nameplates, avatars, status icons and unrelated images are excluded.
+        // The shared native chooser owns both game and listening artwork,
+        // including ContentImage's missing-image fallback. Mark only its direct
+        // content child; cosmetics, avatars and status icons stay excluded.
         for (const child of content?.children ?? []) {
-            for (let fiber = getElementFiber(child); fiber; fiber = fiber.return) {
-                if (!assetFilter(fiber.type)) continue;
-                (child as HTMLElement).dataset.maruNativeActivity = "true";
+            let isArtwork = false;
+            for (let fiber = getElementFiber(child); fiber && fiber.stateNode !== row; fiber = fiber.return) {
+                if (!artworkFilter(fiber.type) && !assetFilter(fiber.type)) continue;
+                isArtwork = true;
                 break;
             }
+            if (isArtwork) (child as HTMLElement).dataset.maruNativeActivity = "true";
+            else delete (child as HTMLElement).dataset.maruNativeActivity;
         }
     }
     if (nativeHoverActions && !friendActionsComponent) {
@@ -1677,6 +1692,9 @@ function getFriendRowData(id: string): FriendRowData | null {
     let gameAssetUrl = nativeRow?.gameAssetUrl ?? null;
     const gameAppId = nativeRow ? nativeRow.gameAppId ?? null
         : gameIndex < 0 ? null : activities[gameIndex].application_id ?? null;
+    // FriendRowStore uses any LISTENING activity; the native chooser gives games
+    // priority and its listening renderer selects/subscribes to the music data.
+    const isListening = nativeRow?.isListening ?? activities.some((activity: any) => activity.type === 2);
     if (!nativeRow && gameIndex >= 0) {
         const game = activities[gameIndex];
         const asset = game.assets?.large_image ?? game.assets?.small_image;
@@ -1703,6 +1721,7 @@ function getFriendRowData(id: string): FriendRowData | null {
         activityBaseText,
         gameAssetUrl,
         gameAppId,
+        isListening,
         voiceChannelId: nativeRow?.voiceChannelId ?? null,
         voiceIcon: icon === "voice" ? nativeChannelIcon?.(ChannelStore.getChannel(voiceChannelId)) ?? null : null
     };
@@ -1785,10 +1804,12 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
     const actionsHost = document.createElement("span");
     actionsHost.className = "maruFriendActionsHost";
     let assetRenderer = nativeActivityAsset;
+    let artworkRenderer = nativeRowArtwork;
     let actionsRenderer = friendActionsComponent;
 
     function renderVisuals(data: FriendRowData) {
         assetRenderer = nativeActivityAsset;
+        artworkRenderer = nativeRowArtwork;
         actionsRenderer = friendActionsComponent;
         // Native theme context selects the equipped Nameplate palette.
         // Reuse the same provider bridge as profiles, keeping this root stable.
@@ -1804,7 +1825,13 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
                 plateHost,
                 content: contentRef
             }),
-            assetRenderer && (data.gameAppId || data.gameAssetUrl) && ReactDOM.createPortal(
+            artworkRenderer ? (data.gameAppId != null || data.isListening) && ReactDOM.createPortal(
+                React.createElement(ErrorBoundary, { noop: true },
+                    React.createElement(artworkRenderer, {
+                        row: { userId: id, gameAppId: data.gameAppId, gameAssetUrl: data.gameAssetUrl, isListening: data.isListening },
+                        sectionType: nativeSectionTypes?.[data.section.toUpperCase()]
+                    })), gameAssetHost)
+                : assetRenderer && (data.gameAppId || data.gameAssetUrl) && ReactDOM.createPortal(
                 React.createElement(ErrorBoundary, { noop: true },
                     React.createElement(assetRenderer, { gameAppId: data.gameAppId, gameAssetUrl: data.gameAssetUrl })),
                 gameAssetHost),
@@ -1861,8 +1888,11 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
 
     let gameAsset: HTMLImageElement | null = null;
     function updateGameAsset(data: FriendRowData) {
-        const nativeAsset = nativeActivityAsset && (data.gameAppId || data.gameAssetUrl);
-        if (!nativeAsset && !data.gameAssetUrl) {
+        const nativeAsset = nativeRowArtwork
+            ? data.gameAppId != null || data.isListening
+            : nativeActivityAsset && (data.gameAppId || data.gameAssetUrl);
+        const fallbackAsset = !nativeRowArtwork && data.gameAssetUrl;
+        if (!nativeAsset && !fallbackAsset) {
             gameAssetHost.remove();
             gameAsset?.remove();
             gameAsset = null;
@@ -1888,7 +1918,7 @@ function createFriendRow(id: string, data: FriendRowData): HTMLElement {
 
     friendRowUpdates.set(row, next => {
         // Reconcile props on the existing React root; never remount for presence updates.
-        if (next.avatarSrc !== current.avatarSrc || next.status !== current.status || next.user !== current.user || next.displayName !== current.displayName || next.gameAppId !== current.gameAppId || next.gameAssetUrl !== current.gameAssetUrl || next.voiceChannelId !== current.voiceChannelId || assetRenderer !== nativeActivityAsset || actionsRenderer !== friendActionsComponent)
+        if (next.avatarSrc !== current.avatarSrc || next.status !== current.status || next.user !== current.user || next.displayName !== current.displayName || next.gameAppId !== current.gameAppId || next.gameAssetUrl !== current.gameAssetUrl || next.isListening !== current.isListening || next.voiceChannelId !== current.voiceChannelId || assetRenderer !== nativeActivityAsset || artworkRenderer !== nativeRowArtwork || actionsRenderer !== friendActionsComponent)
             renderVisuals(next);
         if (!friendCosmeticsComponent && next.displayName !== current.displayName)
             name.textContent = next.displayName;
@@ -2554,6 +2584,7 @@ export default definePlugin({
         restoreModeButton();
         restoreNativeSidebar();
         unmountAvatars();
+        nativeRowArtwork = null;
         restoreNativeSidebarActions();
         friendAvatarComponent = null;
         nativeAvatarHook = null;
