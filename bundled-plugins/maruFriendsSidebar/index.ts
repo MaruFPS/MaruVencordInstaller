@@ -3,7 +3,9 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import { currentUserCategories } from "@plugins/pinDms/data";
 import definePlugin, { OptionType } from "@utils/types";
 import { extractAndLoadChunksLazy, filters, find, findAll, findModuleId, findStore, findStoreLazy, wreq } from "@webpack";
-import { ApplicationAssetUtils, Avatar, ChannelStore, ContextMenuApi, createRoot, Menu, PermissionsBits, PermissionStore, React, ReactDOM, RelationshipStore, useStateFromStores, VoiceStateStore } from "@webpack/common";
+import { AccessibilityStore, ApplicationAssetUtils, Avatar, ChannelStore, ContextMenuApi, createRoot, Menu, PermissionsBits, PermissionStore, React, ReactDOM, RelationshipStore, useStateFromStores, VoiceStateStore } from "@webpack/common";
+
+import { type NativeVoiceGroupProjection, projectNativeVoiceGroups } from "./nativeVoiceGroups";
 
 const UserStore: any = findStoreLazy("UserStore");
 const PresenceStore: any = findStoreLazy("PresenceStore");
@@ -78,6 +80,11 @@ let nativeActionStyleElement: HTMLStyleElement | null = null;
 let nativeAgeGatedSpacesEnabled: (() => boolean) | null = null;
 let nativeChannelAgeRestricted: ((channelId: string) => boolean) | null = null;
 const nativeSidebarScopes = new Set<HTMLElement>();
+let nativeVoiceGroup: any = null;
+let nativeVoiceRowTypes: { FRIEND: number; VOICE_GROUP: number; } | null = null;
+let nativeVoiceNavigation: { useNavigator: any; Provider: any; useContainer: any; } | null = null;
+let nativeVoiceGroupsFailed = false;
+const nativeVoiceGroupRoots = new Map<HTMLElement, ReturnType<typeof createRoot>>();
 type SectionKey = "active_now" | "online" | "offline";
 type ActivityIcon = "game" | "music" | "watching" | "voice" | "custom" | null;
 const sections: { key: SectionKey; label: string; }[] = [
@@ -161,6 +168,116 @@ function findNativeExport(...signature: string[]): any {
         return Object.values(wreq(id as any)).find(filter) ?? null;
     } catch {
         return null;
+    }
+}
+
+function captureNativeVoiceGroup(component: any) {
+    // This private function is captured from the inspected native module, not
+    // reconstructed from its output. The patch also captures it when no voice
+    // groups happen to be mounted in Discord's virtualized list.
+    if (!filters.componentByCode("extraMemberCount", "inVoiceSubgroup:!0")(component)) return;
+    if (nativeVoiceGroup === component) return;
+    nativeVoiceGroup = component;
+    if (dualSidebarRunning) scheduleSidebarRefresh();
+}
+
+function captureNativeVoicePresentation(shell: HTMLElement) {
+    if (!nativeVoiceGroup) {
+        for (const group of shell.querySelectorAll('[role="group"]')) {
+            for (let fiber = getElementFiber(group); fiber; fiber = fiber.return)
+                captureNativeVoiceGroup(fiber.type);
+            if (nativeVoiceGroup) break;
+        }
+    }
+    if (!nativeVoiceGroup) return;
+    if (!nativeFriendsContext) captureNativeSectionPresentation();
+    if (nativeVoiceNavigation) return;
+    nativeVoiceRowTypes = find(filters.byProps("FRIEND", "VOICE_GROUP"), { isIndirect: true });
+    // These are the same exported navigator hook and context used by Discord's
+    // virtualized Friends list. Its higher wrapper requires a virtual scroller;
+    // the underlying hook accepts real DOM focus/scroll callbacks instead.
+    const useNavigator = findNativeExport("defaultFocused:", "useVirtualFocus:", "scrollToStart:");
+    const Provider = findNativeExport("navigator:", "containerProps:", ".Provider");
+    const useContainer = findNativeExport('role:"list"', '"aria-orientation":', ".useContext(");
+    if (useNavigator && Provider && useContainer && nativeVoiceRowTypes) {
+        nativeVoiceNavigation = { useNavigator, Provider, useContainer };
+        if (dualSidebarRunning) scheduleSidebarRefresh();
+    }
+}
+
+function NativeVoiceGroupContainer({ projection }: { projection: NativeVoiceGroupProjection; }) {
+    const props = nativeVoiceNavigation!.useContainer();
+    return React.createElement("div", { ...props, style: { "--custom-friend-row-height": "32px" } },
+        React.createElement(nativeVoiceGroup, { row: projection.row, sectionType: projection.sectionType }));
+}
+
+function NativeCategoryVoiceGroup({ projection, host, shell }: {
+    projection: NativeVoiceGroupProjection; host: HTMLElement; shell: HTMLElement;
+}) {
+    const id = React.useId();
+    const enabled = useStateFromStores([AccessibilityStore], () => AccessibilityStore.keyboardModeEnabled);
+    const [presentation, setPresentation] = React.useState(() => ({
+        collapsed: host.closest<HTMLElement>(".maruFriendsList")?.dataset.maruCompact === "true",
+        hovered: shell.matches(":hover")
+    }));
+    const focus = React.useCallback((selector: string) => {
+        const target = host.querySelector<HTMLElement>(selector);
+        target?.focus({ preventScroll: true });
+        target?.scrollIntoView({ block: "nearest" });
+    }, [host]);
+    const scrollToStart = React.useCallback(async () => { host.scrollIntoView({ block: "nearest" }); }, [host]);
+    const scrollToEnd = React.useCallback(async () => { host.scrollIntoView({ block: "nearest" }); }, [host]);
+    const navigator = nativeVoiceNavigation!.useNavigator({ id, isEnabled: enabled, setFocus: focus, scrollToStart, scrollToEnd });
+    React.useEffect(() => {
+        const update = () => setPresentation({
+            collapsed: host.closest<HTMLElement>(".maruFriendsList")?.dataset.maruCompact === "true",
+            hovered: shell.matches(":hover")
+        });
+        const list = host.closest(".maruFriendsList");
+        list?.addEventListener("maruFriendsLayoutChange", update);
+        shell.addEventListener("mouseenter", update);
+        shell.addEventListener("mouseleave", update);
+        update();
+        return () => {
+            list?.removeEventListener("maruFriendsLayoutChange", update);
+            shell.removeEventListener("mouseenter", update);
+            shell.removeEventListener("mouseleave", update);
+        };
+    }, [host, shell]);
+    React.useEffect(() => {
+        // Apply the sidebar's existing More/artwork policy after native children
+        // commit; the DOM observer deliberately ignores our own list updates.
+        captureNativeSidebarActions(shell);
+    }, [projection, shell, presentation.collapsed]);
+    return React.createElement(nativeFriendsContext.Provider, { value: presentation },
+        React.createElement(nativeVoiceNavigation!.Provider, { navigator },
+            React.createElement(NativeVoiceGroupContainer, { projection })));
+}
+
+function renderNativeVoiceGroup(host: HTMLElement, shell: HTMLElement, projection: NativeVoiceGroupProjection) {
+    let root = nativeVoiceGroupRoots.get(host);
+    if (!root) {
+        root = createRoot(host);
+        nativeVoiceGroupRoots.set(host, root);
+    }
+    root.render(inheritNativeSidebarContexts(React.createElement(ErrorBoundary, {
+        fallback: () => null,
+        onError: () => {
+            // Fail back to the existing rows on an upstream contract change;
+            // never leave category members missing behind a broken native group.
+            nativeVoiceGroupsFailed = true;
+            console.warn("[MaruFriendsSidebar] Native voice group failed; restoring ordinary category rows until the plugin restarts.");
+            scheduleSidebarRefresh();
+        }
+    }, React.createElement(NativeCategoryVoiceGroup, { projection, host, shell }))).node);
+}
+
+function unmountNativeVoiceGroups(container?: HTMLElement) {
+    for (const [host, root] of nativeVoiceGroupRoots) {
+        if (!container || container.contains(host)) {
+            nativeVoiceGroupRoots.delete(host);
+            root.unmount();
+        }
     }
 }
 
@@ -507,6 +624,7 @@ function installNativeActionStyles() {
 function captureNativeSidebarActions(shell: HTMLElement) {
     shell.classList.add("maruNativeFriendsSidebar");
     nativeSidebarScopes.add(shell);
+    captureNativeVoicePresentation(shell);
     captureNativeActivityAsset(shell);
     if (!nativeRowClasses) {
         const names = ["container", "active", "row", "content", "actions", "body", "asset"] as const;
@@ -519,7 +637,7 @@ function captureNativeSidebarActions(shell: HTMLElement) {
     const actionFilter = filters.componentByCode("onMoreClick:", "voiceChannel:", "recipientIds:");
     const assetFilter = filters.componentByCode("gameAppId:", "gameAssetUrl:", "size:32");
     const artworkFilter = filters.componentByCode("sectionType:", ".gameAppId", ".isListening");
-    for (const row of shell.querySelectorAll<HTMLElement>('[data-list-item-id^="friends-list___"]')) {
+    for (const row of shell.querySelectorAll<HTMLElement>('[data-list-item-id^="friends-list___"], [data-maru-voice-group] [data-list-item-id]')) {
         for (const button of row.querySelectorAll<HTMLElement>("button")) {
             const buttonFiber = getElementFiber(button);
             const buttonBranch: any[] = [];
@@ -717,6 +835,7 @@ function observeSidebarWidth(shell: HTMLElement) {
 
 function unmountAvatars(container?: HTMLElement) {
     if (!container || (activeProfileBridge && container.contains(activeProfileBridge.row))) closeActiveProfile?.();
+    unmountNativeVoiceGroups(container);
     unmountNativeIcons(container);
     for (const [element, root] of avatarRoots) {
         if (!container || container.contains(element)) {
@@ -2136,10 +2255,32 @@ function populateFriendsSidebar(shell: HTMLElement) {
         [...list.querySelectorAll<HTMLElement>(".maruFriendRow")].map(row => [row.dataset.maruUserId!, row] as const)
     );
     const grouped: Record<SectionKey, { id: string; data: FriendRowData; }[]> = { active_now: [], online: [], offline: [] };
+    const friendSections = new Map<string, SectionKey>();
     for (const id of friendIds) {
         const data = getFriendRowData(id);
-        if (data) grouped[data.section].push({ id, data });
+        if (data) {
+            grouped[data.section].push({ id, data });
+            friendSections.set(id, data.section);
+        }
     }
+    // Only project groups Discord has already produced. Do not group raw voice
+    // states, change FriendRowStore's users/preferences, or write PinDMs data.
+    const voiceGroups = !nativeVoiceGroupsFailed && nativeVoiceGroup && nativeVoiceNavigation && nativeFriendsContext &&
+        nativeVoiceRowTypes && typeof nativeFriendRows?.getSections === "function"
+        ? projectNativeVoiceGroups(nativeFriendRows.getSections(), new Set(friendSections.keys()), nativeVoiceRowTypes.VOICE_GROUP) : [];
+    const voiceMembers = new Set(voiceGroups.flatMap(group => group.row.rows.map(row => row.userId)));
+    for (const group of voiceGroups) {
+        const section = friendSections.get(group.row.rows[0].userId)!;
+        for (const member of group.row.rows) friendSections.set(member.userId, section);
+    }
+    // Native Game groups may include friends with different presence statuses.
+    // Keep each native group intact and count its members in its displayed
+    // section, avoiding empty sections and stale counts for suppressed rows.
+    const entries = sections.flatMap(({ key }) => grouped[key]);
+    for (const { key } of sections) grouped[key] = [];
+    for (const entry of entries) grouped[friendSections.get(entry.id)!].push(entry);
+    const existingGroups = new Map([...list.querySelectorAll<HTMLElement>("[data-maru-voice-group]")]
+        .map(host => [host.dataset.maruVoiceGroup!, host] as const));
     let visibleSectionSeen = false;
     const collator = new Intl.Collator(nativeLocale?.locale, { sensitivity: "base", numeric: true });
     for (const { key, label } of sections) {
@@ -2167,7 +2308,20 @@ function populateFriendsSidebar(shell: HTMLElement) {
         updateSectionVisibility(section, list.dataset.maruCompact === "true");
         grouped[key].sort((a, b) => collator.compare(a.data.displayName, b.data.displayName) || (a.id === b.id ? 0 : BigInt(a.id) < BigInt(b.id) ? -1 : 1));
         let nextRow = rows.firstElementChild;
+        for (const projection of voiceGroups) {
+            if (friendSections.get(projection.row.rows[0].userId) !== key) continue;
+            let host = existingGroups.get(projection.key);
+            if (!host) {
+                host = document.createElement("div");
+                host.dataset.maruVoiceGroup = projection.key;
+            }
+            existingGroups.delete(projection.key);
+            if (host !== nextRow) rows.insertBefore(host, nextRow);
+            nextRow = host.nextElementSibling;
+            renderNativeVoiceGroup(host, shell, projection);
+        }
         for (const { id, data } of grouped[key]) {
+            if (voiceMembers.has(id)) continue;
             let row = existingRows.get(id);
             if (row) {
                 friendRowUpdates.get(row)?.(data);
@@ -2191,6 +2345,10 @@ function populateFriendsSidebar(shell: HTMLElement) {
         unmountAvatars(row);
         row.remove();
     }
+    for (const host of existingGroups.values()) {
+        unmountNativeVoiceGroups(host);
+        host.remove();
+    }
 
     list.scrollTop = previousScrollTop;
     scheduleDurationUpdate();
@@ -2201,6 +2359,12 @@ function populateFriendsSidebar(shell: HTMLElement) {
 function checkForSidebar() {
     ensureDualSidebarRenderer();
     // Discord can remove or replace the shell without going through our list cleanup.
+    for (const [host, root] of nativeVoiceGroupRoots) {
+        if (!host.isConnected) {
+            nativeVoiceGroupRoots.delete(host);
+            root.unmount();
+        }
+    }
     for (const [element, root] of avatarRoots) {
         if (!element.isConnected) {
             avatarRoots.delete(element);
@@ -2474,6 +2638,15 @@ export default definePlugin({
     name: "MaruFriendsSidebar",
     settings: dualSidebarSettings,
     patches: [{
+        find: '"friends-list-group-config"',
+        replacement: {
+            // Hoisted private VoiceGroup({row, sectionType}) in the same module
+            // as the native Friends list. Match its actual prop contract and
+            // verify the component signature again before accepting it.
+            match: /function (\i)\((\i)\)\{let\{row:\i,sectionType:\i\}=\2,/,
+            replace: "$self.captureNativeVoiceGroup($1);$&"
+        }
+    }, {
         find: "member_list_open:",
         replacement: {
             match: /([\w$]+)=([\w$]+)===([\w$.]+)\.MEMBERS;return/,
@@ -2486,6 +2659,8 @@ export default definePlugin({
             replace: "$1=$self.getIndependentProfileSelection($2===$3.PROFILE&&$4,$4);return"
         }
     }],
+
+    captureNativeVoiceGroup,
 
     getIndependentMemberSelection(nativeState: boolean) {
         return dualSidebarRunning ? membersOpen : nativeState;
@@ -2565,6 +2740,10 @@ export default definePlugin({
         nativeFriendsContext = null;
         nativeSectionTypes = null;
         nativeSeparatedClass = null;
+        nativeVoiceGroup = null;
+        nativeVoiceRowTypes = null;
+        nativeVoiceNavigation = null;
+        nativeVoiceGroupsFailed = false;
         widthObserver?.disconnect();
         widthObserver = null;
         observedShell = null;
